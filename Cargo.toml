@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dm-proto", "crates/dm-conn", "crates/dm-pool"]
+members = ["crates/dm-proto", "crates/dm-conn", "crates/dm-pool", "crates/dm-sqlx"]
 
 [workspace.package]
 version = "0.1.0"

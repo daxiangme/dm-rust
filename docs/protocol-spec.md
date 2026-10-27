@@ -285,7 +285,7 @@ TCP connect (NoDelay, KeepAlive)
 | @34 | i32 | 事务状态 TrxStatus |
 
 变长区：先 **参数描述 × 参数个数**，再 **列描述 × 列个数**（§10.1）。参数描述（每个）：
-`i32 colType, i32 prec, i32 scale, i32 nullable, i16 itemFlag, i32(忽略), i16 ioType, i16 nameLen, i16 typeNameLen, i16 tableNameLen, i16 schemaNameLen`，随后依次是这四个字符串（长度即上述字段，无 NUL）；若 itemFlag&2（LOB）：`i32 lobTabId, i16 lobColId`。
+`i32 colType, i32 prec, i32 scale, i32 nullable, i16 itemFlag, i32(忽略), i16 ioType, i16 nameLen, i16 typeNameLen, i16 tableNameLen, i16 schemaNameLen`，随后依次是这四个字符串（长度即上述字段，无 NUL）；若 itemFlag&2（LOB）：`i32 lobTabId, i16 lobColId`。`nullable`：0 = 不可空，1 = 可空（§16 第 20 条）。
 itemFlag 位：1 自增、2 LOB、4 只读、8 类型仅为服务端推荐、0x100 有默认值。ioType：0 IN、1 OUT、2 INOUT、-1 未知。复杂类型（ARRAY/CLASS/RECORD）在列描述末尾追加类型描述符，本驱动不支持。
 
 ## 9. 执行 EXECUTE(13) 及响应
@@ -354,7 +354,7 @@ TrxStatus 由 EXEC 响应更新；客户端据此决定 commit 是否有意义�
 
 ### 10.1 列描述（每列）
 
-`i32 colType, i32 prec, i32 scale, i32 nullable, i16 itemFlag, i32(忽略), i16(忽略), i16 nameLen, i16 typeNameLen, i16 tableNameLen, i16 schemaNameLen`，随后四个字符串；若 STMT_ALLOC 响应指示有 base name：`i16 长度 + baseName`；若 itemFlag&2（LOB）：`i32 lobTabId + i16 lobColId`。
+`i32 colType, i32 prec, i32 scale, i32 nullable, i16 itemFlag, i32(忽略), i16(忽略), i16 nameLen, i16 typeNameLen, i16 tableNameLen, i16 schemaNameLen`，随后四个字符串；若 STMT_ALLOC 响应指示有 base name：`i16 长度 + baseName`；若 itemFlag&2（LOB）：`i32 lobTabId + i16 lobColId`。`nullable`：0 = 不可空，1 = 可空（§16 第 20 条）。
 
 itemFlag：1 自增、2 LOB、4 只读。列修饰：
 - DATETIME/DATETIME2：scale&0x1000 → 本地时区列（去掉该位）；scale&0x2000 → Oracle DATE 语义（去掉该位）。
@@ -508,7 +508,7 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
 
 - 包头 @10 = 返回码 `code`。`code < 0` 且 `code ≠ EC_RN_EXCEED_ROWSET_SIZE` → 错误；`code > 0` 为警告（请求仍然成功，帧要照常解析）；`EC_RN_EXCEED_ROWSET_SIZE` 是“需要继续 fetch”的信号，不是错误。多结果集上两个警告有固定含义：`+100` 是空结果集，`+111` 是没有更多结果集（§10.4、§16 第 19 条）。其它正数没有单独解释。
 - 错误包 body（自 @64）：`i32 n1`+跳过 n1 字节；`i32 n2`+跳过 n2 字节；`i32 n3`+跳过 n3 字节；然后 `i32 长度`+**错误消息字符串**（服务端编码；EUC-KR 在中文环境下按 GB18030 解码）。`[待实测：三段跳过区在真实服务器的内容]`
-- 常见错误码（节选，负数；以实测为准）：-2501 语法错误、-2106 无效对象、-6602 用户名或密码错误 等。
+- 常见错误码（节选，负数；以实测为准，见 §16 第 20 条）：-2007 语法错误、-2106 无效对象、-2501 用户名或密码错误、-2723 未打开 IDENTITY_INSERT 时给自增列赋值、-6602 唯一性约束、-6609 非空约束。
 - 批量错误码 `EC_BP_WITH_ERROR`（§9.2）。
 
 ## 13. 事务
@@ -557,7 +557,7 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
 13. **登录 schema**：登录请求不带 schema 时，服务端会话的当前模式为用户名同名模式；客户端本地记录的"当前模式"在为空时取 `upper(user)`。
 14. **错误包**：布局（三段跳过区 + 长度前缀的消息）与 §12 一致；消息为服务端字符集（UTF-8 实例下为 UTF-8 中文）。登录失败返回的错误码与普通错误包同格式。
 15. **已验证的值类型往返**：TINYINT/SMALLINT/INT/BIGINT、FLOAT/DOUBLE、DECIMAL（含 38 位）、CHAR/VARCHAR（含中文）、BINARY/VARBINARY、DATE/TIME/TIMESTAMP、TIME/TIMESTAMP WITH TIME ZONE、BLOB/CLOB、BIT/BOOLEAN、NULL、INTERVAL YEAR TO MONTH 与 INTERVAL DAY TO SECOND（全部 qualifier，含精度、负值、NULL、绑定参数）。本地时区列未专门测试。
-16. **未验证**：CRC32 模式、GB18030/EUC-KR 实例、BDTA（服务端要求时直接报错）、复杂类型（ARRAY/记录/类）、LOB 的 OUT 参数、DBMS_OUTPUT、DM 集群/读写分离、SM4/RSA 等扩展加密、IPv6。INTERVAL 的 qualifier 与 scale 布局已核实，见第 17 条。存储过程 OUT/INOUT、函数返回值与 `SYS_REFCURSOR` 已核实，见第 18 条。一条 SQL 里的多个 SELECT、以及本版本能否用 `DBMS_SQL.RETURN_RESULT` 造出隐式结果集，已核实，见第 19 条。
+16. **未验证**：CRC32 模式、GB18030/EUC-KR 实例、BDTA（服务端要求时直接报错）、复杂类型（ARRAY/记录/类）、LOB 的 OUT 参数、DBMS_OUTPUT、DM 集群/读写分离、SM4/RSA 等扩展加密、IPv6。错误包里三段跳过区的内容仍是 `[待实测]`。外键约束与 CHECK 约束的错误码这次没有测。INTERVAL 的 qualifier 与 scale 布局已核实，见第 17 条。存储过程 OUT/INOUT、函数返回值与 `SYS_REFCURSOR` 已核实，见第 18 条。一条 SQL 里的多个 SELECT、以及本版本能否用 `DBMS_SQL.RETURN_RESULT` 造出隐式结果集，已核实，见第 19 条。列/参数 `nullable`、语法/登录/唯一/非空错误码、`IDENTITY` 回写，以及事务内的 SAVEPOINT SQL，已核实，见第 20 条。
 17. **INTERVAL 值编码**（§11.2.3 的实测依据，DM8 8.1.4.6）：
     - `INTERVAL '1-2' YEAR TO MONTH` 的 12 字节为 `01 00 00 00  02 00 00 00  96 01 00 00`（年=1，月=2，scale=0x0196=406：lead=9，frac=6，qualifier=1）。`INTERVAL '-1-2' YEAR TO MONTH` 的年、月均为负数（`ff ff ff ff  fe ff ff ff`），scale 不变。
     - `INTERVAL '1' YEAR(2)` 的 scale 低字节为 `0x26`（lead=2，frac=6，qualifier=0）；`MONTH(4)` 为 qualifier=2。列 `interval year to month`（未写精度）的 scale=0x0126=294（lead=2；字面量默认 lead=9）。
@@ -581,3 +581,8 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
     - **序号重读**。多语句 SELECT 执行之后，NEXT_RESULT @20=2 直接给出第二项，@20=1 给出第一项。只有两项时 @20=3 返回 **-6006（无效消息）**。同一连接上随后的其它语句仍然成功。单条 SELECT（sql type 160）在已经收到 +111 之后再写 @20=1，这次仍是 +111，没有把那一行再送出来。顺序消费只用 @20=0。
     - **不取后续结果**。同一 stmt 上 EXECUTE 之后不发 NEXT_RESULT，再次 EXECUTE 仍从第一项开始（值正确）。期间另一条 `select 99 from dual` 也正常。所以 `query` / `execute` 可以只解释第一包。
     - **`DBMS_SQL.RETURN_RESULT` 在这个版本不存在**。`ALL_PROCEDURES` 里 `DBMS_SQL` 有 PARSE、EXECUTE、FETCH_ROWS、TO_REFCURSOR、TO_CURSOR_NUMBER、BIND_VARIABLE、DEFINE_COLUMN 等，没有 `RETURN_RESULT`。匿名块 `open c for select 1 as a from dual; dbms_sql.return_result(c);` 返回 **-2193（无效的方法名[RETURN_RESULT]）**。`create procedure` 把这段正文放进去时，协议层执行成功，PRINT 文本是同一条 -2193，对象处于无效状态；再 `begin` 调用返回 **-7160（对象处于无效状态）**。这个版本用隐式结果集这条路径产不出多结果集。显式 `SYS_REFCURSOR` OUT 参数仍按第 18 条。
+20. **nullable、错误码、IDENTITY 与 SAVEPOINT**（DM8 8.1.4.6）：
+    - **nullable**。`create table t(id int not null primary key, s varchar(20), n int)` 之后，`select id, s, n` 的列描述与 `insert into t(id, s, n) values(?, ?, ?)` 的参数描述一致：`ID` / 对应 INT 参数 `nullable=0`，`S`（VARCHAR）与 `N`（INT）`nullable=1`。未出现 0/1 以外的值。
+    - **错误码**（普通错误包，负数）。`selec 1` 为 **-2007**（第 1 行附近语法错误）。不存在的表为 **-2106**。错误密码与不存在的用户都是 **-2501**，消息为「用户名或密码错误」。主键或 UNIQUE 列重复为 **-6602**（违反唯一性约束）。`NOT NULL` 列不给值时为 **-6609**（违反非空约束）。外键与 CHECK 未测，不要把 -2501 当成语法错误，也不要把 -6602 当成登录失败。
+    - **IDENTITY**。`id int identity(1,1) primary key` 插入一行（只写其它列）后，EXECUTE 响应的影响行数是 1，自增 id 列表是 `[1]`（响应里带了自增 id 标志时客户端才填这个列表）。即使写了列清单，`insert into t(id, s) values(1, 'b')` 在未执行 `SET IDENTITY_INSERT t ON` 时返回 **-2723**，消息为「仅当指定列列表，且SET IDENTITY_INSERT为ON时，才能对自增列赋值」。这不是唯一约束。
+    - **SAVEPOINT 是 SQL，不是新命令号**。协议事务（`begin` 只把 auto_commit 置 0，`commit` / `rollback` 发 CMD_COMMIT=8 / CMD_ROLLBACK=9）里面可以执行 `SAVEPOINT`、`ROLLBACK TO SAVEPOINT`、`RELEASE SAVEPOINT`。一次测量：表里已有已提交的 1 行；事务内再插入 1 行、`SAVEPOINT`、再插入 1 行、`ROLLBACK TO SAVEPOINT` 之后 `count(*)` 为 2（已提交的 1 行 + 保存点之前的那一行）；`RELEASE SAVEPOINT` 成功；协议 `rollback` 之后 `count(*)` 回到 1。

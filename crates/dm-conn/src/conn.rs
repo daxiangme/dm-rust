@@ -1,5 +1,6 @@
 use crate::error::{BatchRowError, Error, Result};
 use crate::options::{CompressAlgo, Compression, ConnectOptions, IsolationLevel};
+use crate::param::{rewrite_jdbc_call, CallResult, OutValue, Param};
 use crate::row::{ExecResult, QueryResult, Row, StatementInfo};
 use crate::stream::Stream;
 use bytes::{Bytes, BytesMut};
@@ -20,6 +21,15 @@ const DRIVER_VERSION: &str = "8.1.3.62";
 const CLIENT_MSG_VERSION: u16 = 8;
 const EC_RN_EXCEED_ROWSET_SIZE: i32 = -7036;
 const EC_BP_WITH_ERROR: i32 = 121;
+
+fn io_name(io: i16) -> &'static str {
+    match io {
+        0 => "IN",
+        1 => "OUT",
+        2 => "INOUT",
+        _ => "UNKNOWN",
+    }
+}
 
 /// 请求日志。LOGIN 变长区是用户名/密码（登录加密时为凭据密文），只记命令号和长度。
 fn log_req(req: &[u8]) {
@@ -378,7 +388,7 @@ impl Connection {
                     prec = value::bucket_prec(maxlen);
                 }
             }
-            types.push(ExecParamType { col_type: ty, prec, scale });
+            types.push(ExecParamType { io_type: 0, col_type: ty, prec, scale });
         }
         let mut out = Vec::with_capacity(rows.len());
         let mut uploads = Vec::new();
@@ -439,6 +449,9 @@ impl Connection {
     }
 
     async fn run_stmt(&mut self, sql: &str, st: &CachedStmt, rows: &[Vec<Value>]) -> Result<Outcome> {
+        if st.params.iter().any(|p| p.io_type == 1 || p.io_type == 2 || p.col_type == CURSOR) {
+            return Err(Error::Other("statement has OUT, INOUT, or REF CURSOR parameters; use Connection::call".into()));
+        }
         let (types, data, uploads) = if st.params.is_empty() { (vec![], vec![], vec![]) } else { self.bind(st, rows)? };
         if !uploads.is_empty() {
             let f = self.send_recv(pre_exec_request(st.id, &types), false).await?;
@@ -473,37 +486,8 @@ impl Connection {
                     }
                 }
             }
-            let mut raw = er.rows;
-            let mut total = er.update_count;
-            let mut got = raw.len() as i64;
-            if (total == i64::MAX || got < total) && !raw.is_empty() || (got < total && er.rows_in_packet == 0) {
-                loop {
-                    if total != i64::MAX && got >= total {
-                        break;
-                    }
-                    let req = fetch_request(st.id, got, self.opts.fetch_size, 0, 0);
-                    debug!(got, total, rows_in_packet = er.rows_in_packet, "fetch");
-                    trace!("fetch req: {:02x?}", &req[..]);
-                    let f = match self.send_recv(req, false).await {
-                        Ok(f) => f,
-                        // 游标耗尽后再取会返回 -2002（执行未准备SQL语句），视为结束
-                        Err(Error::Server { code: -2002, .. }) => break,
-                        Err(e) => return Err(e),
-                    };
-                    let fr = FetchResponse::parse(&f, cols.len())?;
-                    total = fr.total;
-                    if fr.rows.is_empty() {
-                        break;
-                    }
-                    got += fr.rows.len() as i64;
-                    raw.extend(fr.rows);
-                }
-            }
-            let mut out = Vec::with_capacity(raw.len());
-            for r in raw {
-                out.push(self.decode_row(st.id, &cols, r).await?);
-            }
-            Ok(Outcome::Query(QueryResult { columns: cols, rows: out }))
+            let rows = self.drain_rows(st.id, &cols, er.rows, er.update_count, er.rows_in_packet, 0).await?;
+            Ok(Outcome::Query(QueryResult { columns: cols, rows }))
         } else {
             Ok(Outcome::Exec(ExecResult {
                 rows_affected: if er.update_count == i64::MAX { -1 } else { er.update_count },
@@ -512,6 +496,39 @@ impl Connection {
                 print_msg: er.print_msg,
             }))
         }
+    }
+
+    /// 把已经收到的行补全到结果集结束。`rs_id` 为 0 表示当前结果集（查询，以及 NEXT_RESULT 之后的 REF CURSOR）。
+    async fn drain_rows(&mut self, stmt_id: i32, cols: &Arc<Vec<Column>>, mut raw: Vec<RawRow>, mut total: i64, rows_in_packet: u32, rs_id: i16) -> Result<Vec<Row>> {
+        let mut got = raw.len() as i64;
+        if (total == i64::MAX || got < total) && !raw.is_empty() || (got < total && rows_in_packet == 0) {
+            loop {
+                if total != i64::MAX && got >= total {
+                    break;
+                }
+                let req = fetch_request(stmt_id, got, self.opts.fetch_size, rs_id, 0);
+                debug!(got, total, rows_in_packet, "fetch");
+                trace!("fetch req: {:02x?}", &req[..]);
+                let f = match self.send_recv(req, false).await {
+                    Ok(f) => f,
+                    // 游标耗尽后再取会返回 -2002（执行未准备SQL语句），视为结束
+                    Err(Error::Server { code: -2002, .. }) => break,
+                    Err(e) => return Err(e),
+                };
+                let fr = FetchResponse::parse(&f, cols.len())?;
+                total = fr.total;
+                if fr.rows.is_empty() {
+                    break;
+                }
+                got += fr.rows.len() as i64;
+                raw.extend(fr.rows);
+            }
+        }
+        let mut out = Vec::with_capacity(raw.len());
+        for r in raw {
+            out.push(self.decode_row(stmt_id, cols, r).await?);
+        }
+        Ok(out)
     }
 
     fn update_tx(&mut self, er: &ExecResponse) {
@@ -640,6 +657,218 @@ impl Connection {
     pub async fn set_isolation(&mut self, level: IsolationLevel) -> Result<()> {
         self.send_recv(set_isolation_request(level.wire()), false).await?;
         Ok(())
+    }
+
+    /// 调用存储过程、存储函数或匿名 PL/SQL 块，返回 OUT 与 INOUT 的值。
+    ///
+    /// `sql` 可以是 `begin p(?, ?, ?); end;`、`declare ... begin ... end;`、`call p(?, ?)`，
+    /// 也可以是 JDBC 转义 `{call p(?, ?)}` 或 `{?=call f(?, ?)}`。花括号形式由客户端改写成
+    /// 匿名块后再发送（服务端不接受该转义，会报 -2007）。
+    ///
+    /// 参数个数必须与语句一致。PREPARE 给出的 ioType 为 0/1/2 时必须与 [`Param`] 的方向相同，
+    /// 不一致则直接返回错误，不会发送 EXECUTE。ioType 为 -1 时采用调用方声明的方向。
+    /// 服务端已经给出具体类型时按该类型编解码（即使 itemFlag 标了“仅推荐”）；类型为 UNKNOWN 时才用值的自然类型或 `TypeHint`。
+    ///
+    /// `outs` 只包含 OUT 与 INOUT，顺序与参数列表一致。`SYS_REFCURSOR` 为 [`OutValue::Cursor`]，行已全部取回。
+    /// 纯 IN 语句仍用 [`Connection::query`] / [`Connection::execute`]。
+    pub async fn call(&mut self, sql: &str, params: &[Param]) -> Result<CallResult> {
+        let sql = rewrite_jdbc_call(sql);
+        let mut retried = false;
+        loop {
+            let r = self.call_once(&sql, params).await;
+            // 与 query/execute 相同：-7009 表示缓存的语句计划已过期，重新 prepare 再试一次。
+            if !retried && matches!(&r, Err(Error::Server { code: -7009, .. })) {
+                retried = true;
+                continue;
+            }
+            return r;
+        }
+    }
+
+    async fn call_once(&mut self, sql: &str, params: &[Param]) -> Result<CallResult> {
+        let st = self.prepare_cached(sql).await?;
+        let r = self.call_stmt(&st, params).await;
+        if let Err(e) = &r {
+            if matches!(e, Error::Server { .. }) {
+                if self.cache.get(sql).map(|c| c.id) == Some(st.id) {
+                    self.forget(sql);
+                }
+                self.free_stmt(st.id).await;
+                return r;
+            }
+        }
+        self.release_if_uncached(sql, &st).await;
+        r
+    }
+
+    fn bind_call(&self, st: &CachedStmt, params: &[Param]) -> Result<(Vec<ExecParamType>, Vec<ParamData>, Vec<(i16, Vec<u8>)>)> {
+        if params.len() != st.params.len() {
+            return Err(Error::Other(format!("statement expects {} parameters, got {}", st.params.len(), params.len())));
+        }
+        let mut types = Vec::with_capacity(params.len());
+        let mut data = Vec::with_capacity(params.len());
+        let mut uploads = Vec::new();
+        for (i, (sp, p)) in st.params.iter().zip(params.iter()).enumerate() {
+            let user_io = p.io_type();
+            let io = if matches!(sp.io_type, 0 | 1 | 2) {
+                if sp.io_type != user_io {
+                    return Err(Error::Other(format!(
+                        "parameter {} direction mismatch: server ioType is {}, argument is {}",
+                        i + 1,
+                        io_name(sp.io_type),
+                        io_name(user_io)
+                    )));
+                }
+                sp.io_type
+            } else {
+                user_io
+            };
+
+            let (ty, mut prec, scale) = if sp.col_type != UNKNOWN && sp.col_type != NULL {
+                (sp.col_type, sp.prec, sp.scale)
+            } else {
+                match p {
+                    Param::In(v) | Param::InOut(v) if !v.is_null() => v.natural_type(),
+                    Param::In(_) | Param::InOut(_) => (VARCHAR, VARCHAR_PREC, 0),
+                    Param::Out(h) => {
+                        if h.col_type == UNKNOWN || h.col_type == NULL {
+                            (VARCHAR, VARCHAR_PREC, 0)
+                        } else {
+                            (h.col_type, h.prec, h.scale)
+                        }
+                    }
+                }
+            };
+            if matches!(p, Param::In(v) | Param::InOut(v) if !v.is_null()) && (is_char(ty) || matches!(ty, BINARY | VARBINARY)) {
+                let v = match p {
+                    Param::In(v) | Param::InOut(v) => v,
+                    Param::Out(_) => unreachable!(),
+                };
+                let len = match v {
+                    Value::String(s) => self.enc.encode(s).len() as i32,
+                    Value::Bytes(b) => b.len() as i32,
+                    other => other.to_text().map(|t| t.len() as i32).unwrap_or(0),
+                };
+                if len > prec {
+                    prec = value::bucket_prec(len);
+                }
+            }
+            types.push(ExecParamType { io_type: io as i8, col_type: ty, prec, scale });
+
+            // OUT 不写值。CURSOR 也不写（实测写 i32 长度 + stmt id 会被服务端拒绝）。
+            if io == 1 || ty == CURSOR {
+                data.push(ParamData::Absent);
+                continue;
+            }
+            let v = match p {
+                Param::In(v) | Param::InOut(v) => v,
+                Param::Out(_) => return Err(Error::Other(format!("parameter {} is OUT on the client but IN on the server", i + 1))),
+            };
+            if v.is_null() {
+                data.push(ParamData::Null);
+            } else {
+                let b = value::encode_value_with_scale(v, ty, Some(scale), self.enc)?;
+                if matches!(ty, BLOB | CLOB) && b.len() > LOB_INLINE_MAX {
+                    uploads.push((i as i16, b));
+                    data.push(ParamData::OffRow);
+                } else {
+                    data.push(ParamData::Inline(b));
+                }
+            }
+        }
+        Ok((types, data, uploads))
+    }
+
+    async fn call_stmt(&mut self, st: &CachedStmt, params: &[Param]) -> Result<CallResult> {
+        let (types, data, uploads) = self.bind_call(st, params)?;
+        if !uploads.is_empty() {
+            self.send_recv(pre_exec_request(st.id, &types), false).await?;
+            for (idx, bytes) in &uploads {
+                for chunk in bytes.chunks(LOB_CHUNK) {
+                    self.send_recv(put_data_request(st.id, *idx, chunk, self.new_lob), false).await?;
+                }
+            }
+        }
+        let req = exec_request(
+            st.id,
+            &ExecOpts { auto_commit: self.auto_commit, msg_version: self.msg_version, ..Default::default() },
+            &types,
+            &[data],
+        )?;
+        let f = self.send_recv(req, false).await?;
+        trace!("exec raw: {:02x?}", &f.data[..]);
+        // 过程调用的列来自本次响应里的游标，不用 PREPARE 的列，也不写回语句缓存。
+        let mut er = ExecResponse::parse(&f, self.enc, st.base_name, &[])?;
+        self.update_tx(&er);
+
+        let mut outs = Vec::new();
+        let mut out_slot = 0usize;
+        let mut cursor_ord = 0usize;
+        for (i, p) in params.iter().enumerate() {
+            if !matches!(p, Param::Out(_) | Param::InOut(_)) {
+                continue;
+            }
+            if out_slot >= er.out_params.len() {
+                return Err(Error::Other(format!(
+                    "server returned {} OUT values, parameter {} still expects one",
+                    er.out_params.len(),
+                    i + 1
+                )));
+            }
+            let ty = types[i].col_type;
+            if ty == CURSOR {
+                let q = if cursor_ord == 0 {
+                    cursor_ord += 1;
+                    let raw = std::mem::take(&mut er.rows);
+                    self.cursor_result(st, &er, raw).await?
+                } else {
+                    cursor_ord += 1;
+                    let f = self.send_recv(next_result_request(st.id, 0), false).await?;
+                    let mut nr = ExecResponse::parse(&f, self.enc, st.base_name, &[])?;
+                    let raw = std::mem::take(&mut nr.rows);
+                    self.cursor_result(st, &nr, raw).await?
+                };
+                outs.push(OutValue::Cursor(q));
+            } else {
+                let raw = er.out_params[out_slot].clone();
+                let v = match raw {
+                    None => Value::Null,
+                    Some(b) => {
+                        let sp = &st.params[i];
+                        let ctx = ColumnCtx { col_type: ty, new_lob: self.new_lob, lob_tab_id: sp.lob_tab_id, lob_col_id: sp.lob_col_id };
+                        match value::decode_value(&ctx, b, self.enc)? {
+                            Value::Lob(l) => self.resolve_lob(st.id, l).await?,
+                            v => v,
+                        }
+                    }
+                };
+                outs.push(OutValue::Value(v));
+            }
+            out_slot += 1;
+        }
+        if out_slot != er.out_params.len() {
+            return Err(Error::Other(format!("server returned {} OUT values, {} were consumed", er.out_params.len(), out_slot)));
+        }
+        Ok(CallResult {
+            outs,
+            rows_affected: if er.update_count == i64::MAX { -1 } else { er.update_count },
+            print_msg: er.print_msg,
+        })
+    }
+
+    async fn cursor_result(&mut self, st: &CachedStmt, er: &ExecResponse, raw: Vec<RawRow>) -> Result<QueryResult> {
+        if !(is_select(er.sql_type) && (er.columns_from_response || !raw.is_empty())) {
+            return Err(Error::Other(format!(
+                "expected REF CURSOR result set, got sql_type={} columns={} rows={} update_count={}",
+                er.sql_type,
+                er.columns.len(),
+                raw.len(),
+                er.update_count
+            )));
+        }
+        let cols = Arc::new(er.columns.clone());
+        let rows = self.drain_rows(st.id, &cols, raw, er.update_count, er.rows_in_packet, 0).await?;
+        Ok(QueryResult { columns: cols, rows })
     }
 
     /// 释放全部语句句柄并关闭连接。

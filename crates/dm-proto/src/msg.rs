@@ -423,6 +423,8 @@ impl PrepareResponse {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExecParamType {
+    /// 0 IN、1 OUT、2 INOUT（规格 §9）。普通查询恒为 0。
+    pub io_type: i8,
     pub col_type: i32,
     pub prec: i32,
     pub scale: i32,
@@ -436,6 +438,8 @@ pub enum ParamData {
     Inline(Vec<u8>),
     /// 带外 LOB（数据已通过 PUT_DATA 上传）
     OffRow,
+    /// OUT 参数，以及 REF CURSOR：请求中不写值（实测，见规格 §16）
+    Absent,
 }
 
 pub struct ExecOpts {
@@ -470,7 +474,7 @@ pub fn exec_request(stmt_id: i32, o: &ExecOpts, types: &[ExecParamType], rows: &
     w.set_u8(60, 0);
     if !types.is_empty() {
         for t in types {
-            w.push_u8(0);
+            w.push_u8(t.io_type as u8);
             w.push_i32(t.col_type);
             w.push_i32(t.prec);
             w.push_i32(t.scale);
@@ -489,6 +493,7 @@ pub fn exec_request(stmt_id: i32, o: &ExecOpts, types: &[ExecParamType], rows: &
                         w.push_u16_bytes(b);
                     }
                     ParamData::OffRow => w.push_u16(0),
+                    ParamData::Absent => {}
                 }
             }
         }
@@ -791,7 +796,7 @@ pub fn pre_exec_request(stmt_id: i32, types: &[ExecParamType]) -> BytesMut {
     w.set_i16(20, types.len() as i16);
     w.set_u8(22, 0);
     for t in types {
-        w.push_u8(0);
+        w.push_u8(t.io_type as u8);
         w.push_i32(t.col_type);
         w.push_i32(t.prec);
         w.push_i32(t.scale);
@@ -863,7 +868,7 @@ mod tests {
 
     #[test]
     fn exec_roundtrip_rows() {
-        let types = [ExecParamType { col_type: INT, prec: 10, scale: 0 }, ExecParamType { col_type: VARCHAR, prec: 100, scale: 0 }];
+        let types = [ExecParamType { io_type: 0, col_type: INT, prec: 10, scale: 0 }, ExecParamType { io_type: 0, col_type: VARCHAR, prec: 100, scale: 0 }];
         let rows = vec![vec![ParamData::Inline(5i32.to_le_bytes().to_vec()), ParamData::Null], vec![ParamData::Null, ParamData::Inline(b"ab".to_vec())]];
         let f = frame_of(exec_request(3, &ExecOpts::default(), &types, &rows).unwrap());
         assert_eq!(f.u16_at(21).unwrap(), 2);
@@ -909,5 +914,64 @@ mod tests {
         assert_eq!(e.code, -2007);
         assert_eq!(e.message, "语法分析出错");
         let _ = Codec::default();
+    }
+
+    #[test]
+    fn exec_out_inout_and_cursor_omit_values() {
+        let types = [
+            ExecParamType { io_type: 0, col_type: INT, prec: 4, scale: 0 },
+            ExecParamType { io_type: 1, col_type: INT, prec: 4, scale: 0 },
+            ExecParamType { io_type: 2, col_type: VARCHAR, prec: 50, scale: 0 },
+            ExecParamType { io_type: 1, col_type: CURSOR, prec: 32768, scale: 0 },
+        ];
+        let row = vec![
+            ParamData::Inline(3i32.to_le_bytes().to_vec()),
+            ParamData::Absent,
+            ParamData::Inline(b"ab".to_vec()),
+            ParamData::Absent,
+        ];
+        let f = frame_of(exec_request(8, &ExecOpts::default(), &types, &[row]).unwrap());
+        assert_eq!(f.u16_at(21).unwrap(), 4);
+        let mut r = f.body();
+        assert_eq!(r.u8().unwrap(), 0);
+        assert_eq!(r.i32().unwrap(), INT);
+        assert_eq!(r.i32().unwrap(), 4);
+        assert_eq!(r.i32().unwrap(), 0);
+        assert_eq!(r.u8().unwrap(), 1);
+        assert_eq!(r.i32().unwrap(), INT);
+        r.skip(8).unwrap();
+        assert_eq!(r.u8().unwrap(), 2);
+        assert_eq!(r.i32().unwrap(), VARCHAR);
+        r.skip(8).unwrap();
+        assert_eq!(r.u8().unwrap(), 1);
+        assert_eq!(r.i32().unwrap(), CURSOR);
+        assert_eq!(r.i32().unwrap(), 32768);
+        assert_eq!(r.i32().unwrap(), 0);
+        // IN 的 i32，然后 INOUT 的字符串；两个 OUT（含 CURSOR）都没有值字节。
+        assert_eq!(r.u16().unwrap(), 4);
+        assert_eq!(r.i32().unwrap(), 3);
+        assert_eq!(r.u16().unwrap(), 2);
+        assert_eq!(r.bytes(2).unwrap().as_ref(), b"ab");
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn exec_response_out_params_before_result() {
+        let mut w = Writer::new(13, 4);
+        w.set_i16(20, SQL_SELECT2);
+        w.set_u16(22, 0);
+        w.set_i64(24, 0);
+        w.set_u16(32, 2);
+        w.push_u16(4);
+        w.push_i32(13);
+        w.push_u16(NULL_MARK);
+        let f = frame_of(w.finish());
+        let er = ExecResponse::parse(&f, Encoding::Utf8, false, &[]).unwrap();
+        assert_eq!(er.sql_type, SQL_SELECT2);
+        assert_eq!(er.out_params.len(), 2);
+        assert_eq!(er.out_params[0].as_ref().unwrap().as_ref(), 13i32.to_le_bytes());
+        assert!(er.out_params[1].is_none());
+        assert!(er.columns.is_empty());
+        assert!(er.rows.is_empty());
     }
 }

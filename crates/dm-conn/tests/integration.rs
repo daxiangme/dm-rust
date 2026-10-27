@@ -406,3 +406,162 @@ async fn schema_option_and_meta() {
     assert_eq!(info.params.len(), 2);
     assert_eq!(info.columns.len(), 2);
 }
+
+async fn drop_call_objs(c: &mut Connection) {
+    for sql in [
+        "drop procedure P_RS_CALL_IO",
+        "drop procedure P_RS_CALL_CUR",
+        "drop function F_RS_CALL_ADD",
+        "drop procedure P_RS_PROBE",
+        "drop procedure P_RS_CUR",
+        "drop procedure P_RS_CUR2",
+        "drop function F_RS_ADD",
+        "drop table T_RS_CURSRC",
+    ] {
+        let _ = c.execute(sql, &[]).await;
+    }
+}
+
+fn assert_out(v: &OutValue, expect: &Value) {
+    assert_eq!(v.as_value(), Some(expect), "{v:?}");
+}
+
+/// OUT / INOUT（数字、字符串、日期、NULL）、函数返回值、SYS_REFCURSOR。
+#[tokio::test]
+async fn call_out_inout_and_refcursor() {
+    let mut c = conn!();
+    drop_call_objs(&mut c).await;
+    let created = async {
+        c.execute(
+            "create or replace procedure P_RS_CALL_IO(a in int, b out int, c in out int, s in varchar(100), so out varchar(200), si in out varchar(200), d in date, dout out date, di in out date, nout out int) as begin b := a + 10; c := c + a; if s is null then so := null; else so := s || '-out'; end if; if si is null then si := null; else si := si || '-io'; end if; dout := d + 1; di := di + 1; nout := null; end",
+            &[],
+        )
+        .await?;
+        c.execute(
+            "create or replace function F_RS_CALL_ADD(a int, b int) return int as begin return a + b; end",
+            &[],
+        )
+        .await?;
+        c.execute(
+            "create or replace procedure P_RS_CALL_CUR(n in int, c1 out sys_refcursor, c2 out sys_refcursor, c0 out sys_refcursor) as begin open c1 for select level as id, '行' || level as nm from dual connect by level <= n; open c2 for select level as id from dual connect by level <= 3; open c0 for select 1 as id from dual where 2 = 3; end",
+            &[],
+        )
+        .await?;
+        Ok::<(), Error>(())
+    }
+    .await;
+    if let Err(e) = created {
+        drop_call_objs(&mut c).await;
+        panic!("ddl failed: {e}");
+    }
+
+    let io_sql = "begin P_RS_CALL_IO(?, ?, ?, ?, ?, ?, ?, ?, ?, ?); end;";
+    let info = c.prepare(io_sql).await.unwrap();
+    let meta: Vec<_> = info
+        .params
+        .iter()
+        .map(|p| format!("{} ty={} prec={} scale={} io={} flag={} tname={}", p.name, p.col_type, p.prec, p.scale, p.io_type, p.item_flag, p.type_name))
+        .collect();
+    assert_eq!(info.params.iter().map(|p| p.io_type).collect::<Vec<_>>(), vec![0, 1, 2, 0, 1, 2, 0, 1, 2, 1], "{meta:?}");
+    let kinds: Vec<_> = info.params.iter().map(|p| (p.col_type, p.prec, p.scale)).collect();
+    assert_eq!(
+        kinds,
+        vec![(7, 4, 0), (7, 4, 0), (7, 4, 0), (2, 32767, 0), (2, 200, 0), (2, 200, 0), (14, 3, 0), (14, 3, 0), (14, 3, 0), (7, 4, 0)],
+        "{meta:?}"
+    );
+
+    let d0 = Date { year: 2024, month: 2, day: 28 };
+    let d1 = Date { year: 2024, month: 2, day: 29 };
+    let params = |c_in: Value, s_in: Value, si: Value, di: Value| {
+        vec![
+            Param::In(Value::Int(3)),
+            Param::out_int(),
+            Param::InOut(c_in),
+            Param::In(s_in),
+            Param::Out(TypeHint::varchar(200)),
+            Param::InOut(si),
+            Param::In(d0.into()),
+            Param::Out(TypeHint::date()),
+            Param::InOut(di),
+            Param::out_int(),
+        ]
+    };
+    let check = |r: &CallResult, c_out: Value, so: Value, si: Value, di: Value| {
+        assert_eq!(r.outs.len(), 7, "{r:?}");
+        assert_out(&r.outs[0], &Value::Int(13));
+        assert_out(&r.outs[1], &c_out);
+        assert_out(&r.outs[2], &so);
+        assert_out(&r.outs[3], &si);
+        assert_out(&r.outs[4], &Value::Date(d1));
+        assert_out(&r.outs[5], &di);
+        assert_out(&r.outs[6], &Value::Null);
+    };
+
+    let r = c.call("{call P_RS_CALL_IO(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)}", &params(Value::Int(4), "你好".into(), "xy".into(), d0.into())).await.unwrap();
+    check(&r, Value::Int(7), "你好-out".into(), "xy-io".into(), d1.into());
+
+    let r = c.call("call P_RS_CALL_IO(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", &params(Value::Null, Value::Null, Value::Null, Value::Null)).await.unwrap();
+    check(&r, Value::Null, Value::Null, Value::Null, Value::Null);
+
+    let r = c.call(io_sql, &params(Value::Int(4), "你好".into(), "xy".into(), d0.into())).await.unwrap();
+    check(&r, Value::Int(7), "你好-out".into(), "xy-io".into(), d1.into());
+
+    let finfo = c.prepare("begin ? := F_RS_CALL_ADD(?, ?); end;").await.unwrap();
+    let fmeta: Vec<_> = finfo.params.iter().map(|p| format!("ty={} prec={} io={} flag={} name={:?}", p.col_type, p.prec, p.io_type, p.item_flag, p.name)).collect();
+    assert_eq!(finfo.params.iter().map(|p| (p.col_type, p.prec, p.io_type)).collect::<Vec<_>>(), vec![(7, 4, 1), (7, 4, 0), (7, 4, 0)], "{fmeta:?}");
+    let r = c.call("{?=call F_RS_CALL_ADD(?, ?)}", &[Param::out_int(), Param::In(Value::Int(20)), Param::In(Value::Int(22))]).await.unwrap();
+    assert_eq!(r.outs.len(), 1);
+    assert_out(&r.outs[0], &Value::Int(42));
+    let r = c.call("begin ? := F_RS_CALL_ADD(?, ?); end;", &[Param::out_int(), Param::In(Value::Null), Param::In(Value::Int(1))]).await.unwrap();
+    assert_out(&r.outs[0], &Value::Null);
+    let q = c.query("select F_RS_CALL_ADD(?, ?) from dual", &[Value::Int(2), Value::Int(3)]).await.unwrap();
+    assert_eq!(q.rows[0].values[0], Value::Int(5));
+
+    let cinfo = c.prepare("begin P_RS_CALL_CUR(?, ?, ?, ?); end;").await.unwrap();
+    let cmeta: Vec<_> = cinfo.params.iter().map(|p| format!("{} ty={} prec={} scale={} io={} tname={}", p.name, p.col_type, p.prec, p.scale, p.io_type, p.type_name)).collect();
+    assert_eq!(cinfo.params.iter().map(|p| p.io_type).collect::<Vec<_>>(), vec![0, 1, 1, 1], "{cmeta:?}");
+    assert!(cinfo.params[1..].iter().all(|p| p.col_type == 120 && p.prec == 32768), "{cmeta:?}");
+    let r = c
+        .call(
+            "begin P_RS_CALL_CUR(?, ?, ?, ?); end;",
+            &[Param::In(Value::Int(120)), Param::out_cursor(), Param::out_cursor(), Param::out_cursor()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.outs.len(), 3, "{cmeta:?} print={}", r.print_msg);
+    let c1 = r.outs[0].as_cursor().expect("c1");
+    assert_eq!(c1.columns.len(), 2, "{:?}", c1.columns);
+    assert_eq!(c1.rows.len(), 120);
+    for (i, row) in c1.rows.iter().enumerate() {
+        assert_eq!(row.get_by_name("id"), Some(&Value::Int(i as i32 + 1)));
+        assert_eq!(row.get_by_name("nm").and_then(|v| v.as_str()), Some(format!("行{}", i + 1)).as_deref());
+    }
+    let c2 = r.outs[1].as_cursor().expect("c2");
+    assert_eq!(c2.rows.len(), 3);
+    assert_eq!(c2.rows[2].get_by_name("id"), Some(&Value::Int(3)));
+    let c0 = r.outs[2].as_cursor().expect("c0");
+    assert!(c0.rows.is_empty(), "{c0:?}");
+    assert_eq!(c0.columns.len(), 1, "{:?}", c0.columns);
+
+    let anon = c.prepare("begin ? := ? + 5; end;").await.unwrap();
+    let ameta: Vec<_> = anon.params.iter().map(|p| format!("ty={} prec={} io={} flag={}", p.col_type, p.prec, p.io_type, p.item_flag)).collect();
+    assert_eq!(anon.params.iter().map(|p| (p.col_type, p.prec, p.io_type)).collect::<Vec<_>>(), vec![(7, 10, 1), (7, 10, 0)], "{ameta:?}");
+    let r = c.call("begin ? := ? + 5; end;", &[Param::out_int(), Param::In(Value::Int(10))]).await.unwrap();
+    assert_out(&r.outs[0], &Value::Int(15));
+    let declared = c.prepare("declare v int; begin v := ?; ? := v + 5; end;").await.unwrap();
+    let dmeta: Vec<_> = declared.params.iter().map(|p| format!("ty={} prec={} io={} flag={}", p.col_type, p.prec, p.io_type, p.item_flag)).collect();
+    assert_eq!(declared.params.iter().map(|p| (p.col_type, p.prec, p.io_type)).collect::<Vec<_>>(), vec![(7, 4, 0), (7, 4, 1)], "{dmeta:?}");
+    let r = c.call("declare v int; begin v := ?; ? := v + 5; end;", &[Param::In(Value::Int(10)), Param::out_int()]).await.unwrap();
+    assert_out(&r.outs[0], &Value::Int(15));
+
+    let guard = c.execute(io_sql, &[]).await.unwrap_err();
+    assert!(guard.to_string().contains("Connection::call"), "{guard}");
+    let guard = c.query("begin P_RS_CALL_CUR(?, ?, ?, ?); end;", &[Value::Int(1)]).await.unwrap_err();
+    assert!(guard.to_string().contains("Connection::call"), "{guard}");
+    let bad = vec![Param::In(Value::Int(1)); 10];
+    let guard = c.call(io_sql, &bad).await.unwrap_err();
+    assert!(guard.to_string().contains("direction"), "{guard}");
+    c.query("select 1 from dual", &[]).await.unwrap();
+
+    drop_call_objs(&mut c).await;
+}

@@ -9,7 +9,7 @@
 | crate | 内容 |
 |---|---|
 | `dm-proto` | 无 IO 的协议编解码：帧读写（`Bytes` 零拷贝）、STARTUP/LOGIN/PREPARE/EXEC/FETCH/LOB 等消息、DH + 对称加密（DES/3DES/AES/RC4 × ECB/CBC/CFB/OFB）、zlib/snappy 压缩、XOR/CRC32 校验、值类型编解码（DECIMAL/日期时间/时区/INTERVAL/LOB 头…） |
-| `dm-conn` | tokio 异步连接：握手（含 rustls TLS）、登录、语句缓存（LRU）、`query/execute/execute_batch`、事务、隔离级别、LOB 读写、压缩/整报文加密、取消安全（future 被丢弃后连接标记为 broken） |
+| `dm-conn` | tokio 异步连接：握手（含 rustls TLS）、登录、语句缓存（LRU）、`query/execute/execute_batch`、存储过程 `call`（OUT/INOUT/`SYS_REFCURSOR`）、事务、隔离级别、LOB 读写、压缩/整报文加密、取消安全（future 被丢弃后连接标记为 broken） |
 | `dm-pool` | 连接池：信号量限流、LIFO 空闲复用、idle/lifetime 过期、取出时 ping、事务中/损坏连接归还时丢弃 |
 
 ## 用法
@@ -24,6 +24,22 @@ let r = c.query("select ? + 1 from dual", &[1.into()]).await?;
 let ym = dm_conn::IntervalYm::new(1, 2); // INTERVAL '1-2' YEAR(9) TO MONTH
 let dt = dm_conn::IntervalDt::new(3, 4, 5, 6, 789_000_000); // 小数秒单位纳秒，线上精确到微秒
 c.execute("insert into t_iv(ym, dt) values(?, ?)", &[ym.into(), dt.into()]).await?;
+
+// 存储过程 / 函数。OUT、INOUT 与 SYS_REFCURSOR 走 call；query/execute 仍只接受 IN。
+// `{call ...}` 与 `{?=call ...}` 会在客户端改写成 `begin ... end;`（服务端不接受花括号）。
+// `declare ... begin ... end;` 与 `call p(?, ?)` 原样发送。
+let out = c.call(
+    "begin p_add(?, ?, ?); end;",
+    &[dm_conn::Param::In(2.into()), dm_conn::Param::In(3.into()), dm_conn::Param::out_int()],
+).await?;
+assert_eq!(out.outs[0].as_value(), Some(&dm_conn::Value::Int(5)));
+
+let f = c.call("{?=call f_add(?, ?)}", &[dm_conn::Param::out_int(), dm_conn::Param::In(2.into()), dm_conn::Param::In(3.into())]).await?;
+assert_eq!(f.outs[0].as_value(), Some(&dm_conn::Value::Int(5)));
+
+let cur = c.call("begin p_rows(?, ?); end;", &[dm_conn::Param::In(10.into()), dm_conn::Param::out_cursor()]).await?;
+let rows = cur.outs[0].as_cursor().unwrap();
+assert_eq!(rows.rows.len(), 10);
 ```
 
 示例：`cargo run -p dm-conn --example basic|tx_batch`，`cargo run -p dm-pool --example pool`。

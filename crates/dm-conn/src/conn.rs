@@ -388,7 +388,8 @@ impl Connection {
                 if v.is_null() {
                     row.push(ParamData::Null);
                 } else {
-                    let b = value::encode_value(v, types[i].col_type, self.enc)?;
+                    // INTERVAL 值内 scale 与参数描述的 scale 不一致时，服务端返回 -6117。
+                    let b = value::encode_value_with_scale(v, types[i].col_type, Some(types[i].scale), self.enc)?;
                     if matches!(types[i].col_type, BLOB | CLOB) && b.len() > LOB_INLINE_MAX {
                         if rows.len() != 1 {
                             return Err(Error::Other("批量执行不支持大于 2048 字节的 LOB 参数".into()));

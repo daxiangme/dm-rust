@@ -6,7 +6,7 @@ mod row;
 mod stream;
 
 pub use conn::Connection;
-pub use dm_proto::value::{Date, DateTime, Decimal, Time};
+pub use dm_proto::value::{Date, DateTime, Decimal, IntervalDt, IntervalQual, IntervalYm, Time};
 pub use dm_proto::{msg::Column, Value};
 pub use error::{BatchRowError, Error, Result};
 pub use options::{CompressAlgo, Compression, ConnectOptions, IsolationLevel};

@@ -8,7 +8,7 @@
 
 | crate | 内容 |
 |---|---|
-| `dm-proto` | 无 IO 的协议编解码：帧读写（`Bytes` 零拷贝）、STARTUP/LOGIN/PREPARE/EXEC/FETCH/LOB 等消息、DH + 对称加密（DES/3DES/AES/RC4 × ECB/CBC/CFB/OFB）、zlib/snappy 压缩、XOR/CRC32 校验、值类型编解码（DECIMAL/日期时间/时区/LOB 头…） |
+| `dm-proto` | 无 IO 的协议编解码：帧读写（`Bytes` 零拷贝）、STARTUP/LOGIN/PREPARE/EXEC/FETCH/LOB 等消息、DH + 对称加密（DES/3DES/AES/RC4 × ECB/CBC/CFB/OFB）、zlib/snappy 压缩、XOR/CRC32 校验、值类型编解码（DECIMAL/日期时间/时区/INTERVAL/LOB 头…） |
 | `dm-conn` | tokio 异步连接：握手（含 rustls TLS）、登录、语句缓存（LRU）、`query/execute/execute_batch`、事务、隔离级别、LOB 读写、压缩/整报文加密、取消安全（future 被丢弃后连接标记为 broken） |
 | `dm-pool` | 连接池：信号量限流、LIFO 空闲复用、idle/lifetime 过期、取出时 ping、事务中/损坏连接归还时丢弃 |
 
@@ -18,6 +18,12 @@
 let opts = dm_conn::ConnectOptions::from_url("dm://SYSDBA:SYSDBA001@127.0.0.1:5236")?;
 let mut c = dm_conn::Connection::connect(&opts).await?;
 let r = c.query("select ? + 1 from dual", &[1.into()]).await?;
+
+// INTERVAL：IntervalYm / IntervalDt 带前导精度与 qualifier，Display 与服务端 cast 文本一致。
+// 绑定到表列时，写入的精度以列定义为准。
+let ym = dm_conn::IntervalYm::new(1, 2); // INTERVAL '1-2' YEAR(9) TO MONTH
+let dt = dm_conn::IntervalDt::new(3, 4, 5, 6, 789_000_000); // 小数秒单位纳秒，线上精确到微秒
+c.execute("insert into t_iv(ym, dt) values(?, ?)", &[ym.into(), dt.into()]).await?;
 ```
 
 示例：`cargo run -p dm-conn --example basic|tx_batch`，`cargo run -p dm-pool --example pool`。

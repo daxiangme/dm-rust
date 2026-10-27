@@ -388,7 +388,7 @@ itemFlag：1 自增、2 LOB、4 只读。列修饰：
 ### 11.1 类型码
 
 CHAR 0、VARCHAR2 1、VARCHAR 2、BIT 3、TINYINT 5、SMALLINT 6、INT 7、BIGINT 8、DECIMAL 9、REAL 10、DOUBLE 11、BLOB 12、BOOLEAN 13、DATE 14、TIME 15、DATETIME 16、BINARY 17、VARBINARY 18、CLOB 19、INTERVAL_YM 20、INTERVAL_DT 21、TIME_TZ 22、DATETIME_TZ 23、DATETIME2 26、DATETIME2_TZ 27、NULL 28、ARRAY 117、CLASS 119、CURSOR 120、PLTYPE_RECORD 121、SARRAY 122、UNKNOWN 54。
-默认精度：DATE 3、TIME 5、DATETIME 8、DATETIME2 9、TIME_TZ 7、DATETIME_TZ 10、DATETIME2_TZ 11、INTERVAL_YM 12、INTERVAL_DT 24；VARCHAR/VARBINARY 最大 8188。
+默认精度：DATE 3、TIME 5、DATETIME 8、DATETIME2 9、TIME_TZ 7、DATETIME_TZ 10、DATETIME2_TZ 11、INTERVAL_YM 12、INTERVAL_DT 24（后两者的 prec 是值字节数；前导精度与 qualifier 在 scale，见 §11.2.3）；VARCHAR/VARBINARY 最大 8188。
 
 ### 11.2 各类型字节表示（行数据和参数通用）
 
@@ -410,8 +410,8 @@ CHAR 0、VARCHAR2 1、VARCHAR 2、BIT 3、TINYINT 5、SMALLINT 6、INT 7、BIGIN
 | DATETIME2 | 9 字节 |
 | DATETIME_TZ | 10 字节（8 + i16 时区） |
 | DATETIME2_TZ | 11 字节（9 + i16 时区；读取时区位置 = 长度−2） |
-| INTERVAL_YM | 12 字节：i32 年、i32 月、i32 scale（@8，高 4 位=前导精度）、@9 低字节为 qualifier 类型 `[待实测]` |
-| INTERVAL_DT | 24 字节：i32 日、时、分、秒、小数秒；@20 i32 scale；@21 为 qualifier |
+| INTERVAL_YM | 12 字节，小端：i32 年、i32 月、i32 scale（@8）。scale 布局见 §11.2.3 |
+| INTERVAL_DT | 24 字节，小端：i32 日、时、分、秒、i32 小数秒（微秒）、i32 scale（@20）。scale 布局见 §11.2.3 |
 | BLOB / CLOB | LOB 头，见 §11.3 |
 
 类型根据长度判别时区/精度：解码 DATE/TIME 等时，依 `len(value)` 为 3/5/7/8/9/10/11 判断类型（行存格式）。
@@ -432,6 +432,41 @@ CHAR 0、VARCHAR2 1、VARCHAR 2、BIT 3、TINYINT 5、SMALLINT 6、INT 7、BIGIN
 - 时区（TZ 类型）：末尾 i16，单位分钟。
 - 编码是上面的逆过程。DATETIME 写入微秒（纳秒/1000）。
 - 本地时区列（scale 标志 0x1000）：服务端以数据库时区存储，客户端需按（客户端时区 − 数据库时区）调整；`[待实测，默认实现不调整并在文档标注]`。
+
+#### 11.2.3 INTERVAL 的 scale 与 qualifier
+
+YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描述里的 `scale` 是同一个字。字节（相对该 i32 的起点）：
+
+| 偏移 | 含义 |
+|---|---|
+| @0 的高 4 位 | 前导精度 `lead_prec`，合法值 1..=9 |
+| @0 的低 4 位 | 小数秒精度 `frac_prec`。含 SECOND 的限定符为 0..=6；其余限定符实测恒为 6 |
+| @1 | qualifier（下表） |
+| @2..@3 | 0 |
+
+即 `scale = (qualifier << 8) | (lead_prec << 4) | frac_prec`。
+
+| qualifier | SQL | 类型码 |
+|---|---|---|
+| 0 | YEAR | INTERVAL_YM (20) |
+| 1 | YEAR TO MONTH | INTERVAL_YM (20) |
+| 2 | MONTH | INTERVAL_YM (20) |
+| 3 | DAY | INTERVAL_DT (21) |
+| 4 | DAY TO HOUR | INTERVAL_DT (21) |
+| 5 | DAY TO MINUTE | INTERVAL_DT (21) |
+| 6 | DAY TO SECOND | INTERVAL_DT (21) |
+| 7 | HOUR | INTERVAL_DT (21) |
+| 8 | HOUR TO MINUTE | INTERVAL_DT (21) |
+| 9 | HOUR TO SECOND | INTERVAL_DT (21) |
+| 10 | MINUTE | INTERVAL_DT (21) |
+| 11 | MINUTE TO SECOND | INTERVAL_DT (21) |
+| 12 | SECOND | INTERVAL_DT (21) |
+
+小数秒是**有符号 i32，单位微秒**，与 `frac_prec` 无关：不足 6 位时低位补 0（`0.789` 且 frac_prec=3 存 `789000`；`-0.000001` 存 `-1`）。负间隔的每个分量都 ≤ 0。年月日字段各自独立存放，不互相进位（`INTERVAL '13' MONTH` 的月是 13，年是 0）。`YEAR TO MONTH` 的月必须在 0..=11，否则服务端 -6171。
+
+前导精度：SQL **字面量**省略时为 **9**，**列定义**省略时为 **2**。`lead_prec = 0` 报 -6143；年月 `lead_prec > 9` 报 -6125；日时 `lead_prec > 9` 或 `frac_prec > 6` 报 -6126。单个字段绝对值最大 999999999（超出为 -6115）。`prec` 与这些精度无关，YM 恒为 12，DT 恒为 24。
+
+参数绑定时，值字节里的 scale 必须与参数描述的 scale 相同，否则服务端返回 **-6117（INTERVAL数据溢出）**。绑定到已声明类型的列时，用列的 scale 覆盖值内 scale（数值仍按列精度检查）；`select ?` 这类推荐类型则用值自带的 lead/frac/qualifier。
 
 ### 11.3 LOB
 
@@ -511,5 +546,11 @@ CHAR 0、VARCHAR2 1、VARCHAR 2、BIT 3、TINYINT 5、SMALLINT 6、INT 7、BIGIN
 12. **响应解析容错**：响应 body 末尾可能有未识别的多余字节（实测存在），解析器应按字段顺序读取而不要求恰好消耗完整个 body。
 13. **登录 schema**：登录请求不带 schema 时，服务端会话的当前模式为用户名同名模式；客户端本地记录的"当前模式"在为空时取 `upper(user)`。
 14. **错误包**：布局（三段跳过区 + 长度前缀的消息）与 §12 一致；消息为服务端字符集（UTF-8 实例下为 UTF-8 中文）。登录失败返回的错误码与普通错误包同格式。
-15. **已验证的值类型往返**：TINYINT/SMALLINT/INT/BIGINT、FLOAT/DOUBLE、DECIMAL（含 38 位）、CHAR/VARCHAR（含中文）、BINARY/VARBINARY、DATE/TIME/TIMESTAMP、TIME/TIMESTAMP WITH TIME ZONE、BLOB/CLOB、BIT/BOOLEAN、NULL。INTERVAL 类型与本地时区列未专门测试。
-16. **未验证**：CRC32 模式、GB18030/EUC-KR 实例、BDTA（服务端要求时直接报错）、多结果集 NEXT_RESULT、存储过程 OUT 参数/游标、REFCURSOR/复杂类型（ARRAY/记录/类）、DM 集群/读写分离、SM4/RSA 等扩展加密、IPv6。
+15. **已验证的值类型往返**：TINYINT/SMALLINT/INT/BIGINT、FLOAT/DOUBLE、DECIMAL（含 38 位）、CHAR/VARCHAR（含中文）、BINARY/VARBINARY、DATE/TIME/TIMESTAMP、TIME/TIMESTAMP WITH TIME ZONE、BLOB/CLOB、BIT/BOOLEAN、NULL、INTERVAL YEAR TO MONTH 与 INTERVAL DAY TO SECOND（全部 qualifier，含精度、负值、NULL、绑定参数）。本地时区列未专门测试。
+16. **未验证**：CRC32 模式、GB18030/EUC-KR 实例、BDTA（服务端要求时直接报错）、多结果集 NEXT_RESULT、存储过程 OUT 参数/游标、REFCURSOR/复杂类型（ARRAY/记录/类）、DM 集群/读写分离、SM4/RSA 等扩展加密、IPv6。INTERVAL 的 qualifier 与 scale 布局已核实，见第 17 条，不在此列。
+17. **INTERVAL 值编码**（§11.2.3 的实测依据，DM8 8.1.4.6）：
+    - `INTERVAL '1-2' YEAR TO MONTH` 的 12 字节为 `01 00 00 00  02 00 00 00  96 01 00 00`（年=1，月=2，scale=0x0196=406：lead=9，frac=6，qualifier=1）。`INTERVAL '-1-2' YEAR TO MONTH` 的年、月均为负数（`ff ff ff ff  fe ff ff ff`），scale 不变。
+    - `INTERVAL '1' YEAR(2)` 的 scale 低字节为 `0x26`（lead=2，frac=6，qualifier=0）；`MONTH(4)` 为 qualifier=2。列 `interval year to month`（未写精度）的 scale=0x0126=294（lead=2；字面量默认 lead=9）。
+    - `INTERVAL '3 04:05:06.789' DAY TO SECOND` 的 24 字节为日/时/分/秒/微秒五段 i32：`3, 4, 5, 6, 789000`，随后 `96 06 00 00`（scale=0x0696=1686，qualifier=6）。`INTERVAL '-3 04:05:06.789' DAY TO SECOND` 五段全为负。`INTERVAL '-0.000001' SECOND` 的秒为 0、微秒为 -1。
+    - qualifier 0..12 与 YEAR、YEAR TO MONTH、MONTH、DAY、DAY TO HOUR、DAY TO MINUTE、DAY TO SECOND、HOUR、HOUR TO MINUTE、HOUR TO SECOND、MINUTE、MINUTE TO SECOND、SECOND 一一对应。`SECOND(2,6)` 的 scale 低字节为 `0x26`；`DAY(4) TO SECOND(3)` 为 `0x43`；`SECOND(5,0)` 为 `0x50`。
+    - 表列往返：插入绑定参数后读回的 scale 等于列描述的 scale（prec 仍是 12 或 24）。值内 scale 与参数描述不一致时返回 -6117。`lead_prec` 超出 1..=9 或 `frac_prec` > 6 在 SQL 层被拒绝，没有额外的线上变体。scale 的高 16 位在全部样本中为 0。

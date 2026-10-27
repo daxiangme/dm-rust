@@ -250,6 +250,154 @@ async fn stmt_cache_and_reuse() {
 }
 
 #[tokio::test]
+async fn intervals() {
+    let mut c = conn!();
+    // 字面量的 Display 与服务端 cast 一致，同时核对解码出的分量。
+    let literals: &[(&str, Value)] = &[
+        ("INTERVAL '1-2' YEAR TO MONTH", IntervalYm::new(1, 2).into()),
+        (
+            "INTERVAL '-100-11' YEAR(3) TO MONTH",
+            IntervalYm { years: -100, months: -11, lead_prec: 3, frac_prec: 6, qualifier: IntervalQual::YearToMonth }.into(),
+        ),
+        ("INTERVAL '1' YEAR(2)", IntervalYm { lead_prec: 2, ..IntervalYm::year(1) }.into()),
+        ("INTERVAL '13' MONTH(4)", IntervalYm { months: 13, lead_prec: 4, ..IntervalYm::month(0) }.into()),
+        ("INTERVAL '-0-1' YEAR TO MONTH", IntervalYm { months: -1, ..IntervalYm::new(0, 0) }.into()),
+        ("INTERVAL '3 04:05:06.789' DAY TO SECOND", IntervalDt::new(3, 4, 5, 6, 789_000_000).into()),
+        (
+            "INTERVAL '-3 04:05:06.789' DAY TO SECOND",
+            IntervalDt { days: -3, hours: -4, minutes: -5, seconds: -6, nanos: -789_000_000, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        ),
+        ("INTERVAL '-0.000001' SECOND", IntervalDt { nanos: -1_000, qualifier: IntervalQual::Second, ..IntervalDt::new(0, 0, 0, 0, 0) }.into()),
+        ("INTERVAL '3' DAY(2)", IntervalDt { days: 3, lead_prec: 2, qualifier: IntervalQual::Day, ..IntervalDt::new(0, 0, 0, 0, 0) }.into()),
+        ("INTERVAL '4' HOUR(3)", IntervalDt { hours: 4, lead_prec: 3, qualifier: IntervalQual::Hour, ..IntervalDt::new(0, 0, 0, 0, 0) }.into()),
+        ("INTERVAL '5' MINUTE(4)", IntervalDt { minutes: 5, lead_prec: 4, qualifier: IntervalQual::Minute, ..IntervalDt::new(0, 0, 0, 0, 0) }.into()),
+        (
+            "INTERVAL '6.789' SECOND(1,3)",
+            IntervalDt { seconds: 6, nanos: 789_000_000, lead_prec: 1, frac_prec: 3, qualifier: IntervalQual::Second, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        ),
+        ("INTERVAL '3 04' DAY(2) TO HOUR", IntervalDt { days: 3, hours: 4, lead_prec: 2, qualifier: IntervalQual::DayToHour, ..IntervalDt::new(0, 0, 0, 0, 0) }.into()),
+        (
+            "INTERVAL '3 04:05' DAY(3) TO MINUTE",
+            IntervalDt { days: 3, hours: 4, minutes: 5, lead_prec: 3, qualifier: IntervalQual::DayToMinute, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        ),
+        (
+            "INTERVAL '04:05' HOUR(2) TO MINUTE",
+            IntervalDt { hours: 4, minutes: 5, lead_prec: 2, qualifier: IntervalQual::HourToMinute, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        ),
+        (
+            "INTERVAL '04:05:06.7' HOUR(2) TO SECOND(1)",
+            IntervalDt { hours: 4, minutes: 5, seconds: 6, nanos: 700_000_000, lead_prec: 2, frac_prec: 1, qualifier: IntervalQual::HourToSecond, ..IntervalDt::new(0, 0, 0, 0, 0) }
+                .into(),
+        ),
+        (
+            "INTERVAL '05:06.78' MINUTE(2) TO SECOND(2)",
+            IntervalDt { minutes: 5, seconds: 6, nanos: 780_000_000, lead_prec: 2, frac_prec: 2, qualifier: IntervalQual::MinuteToSecond, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        ),
+        ("INTERVAL '1 2:3:4' DAY TO SECOND(0)", IntervalDt { days: 1, hours: 2, minutes: 3, seconds: 4, frac_prec: 0, ..IntervalDt::new(0, 0, 0, 0, 0) }.into()),
+    ];
+    for (expr, expect) in literals {
+        let r = c.query(&format!("select {expr}, cast({expr} as varchar(80)) from dual"), &[]).await.unwrap();
+        assert_eq!(&r.rows[0].values[0], expect, "{expr}");
+        assert_eq!(r.rows[0].values[0].to_text().as_deref(), r.rows[0].values[1].as_str(), "{expr}");
+        assert_eq!(r.columns[0].col_type, if expect.as_interval_ym().is_some() { 20 } else { 21 }, "{expr}");
+    }
+    let r = c.query("select cast(null as interval year to month), cast(null as interval day to second) from dual", &[]).await.unwrap();
+    assert!(r.rows[0].values.iter().all(|v| v.is_null()));
+
+    // 无类型占位：精度随值走，读回无损。
+    let bound = IntervalDt { seconds: 6, nanos: 789_123_000, lead_prec: 2, frac_prec: 6, qualifier: IntervalQual::Second, ..IntervalDt::new(0, 0, 0, 0, 0) };
+    let r = c.query("select ? from dual", &[bound.into()]).await.unwrap();
+    assert_eq!(r.rows[0].values[0], Value::IntervalDt(bound));
+    assert_eq!(r.columns[0].col_type, 21);
+    assert_eq!(r.columns[0].scale, bound.scale_word());
+    let r = c.query("select ? from dual", &[IntervalYm::new(-1, -2).into()]).await.unwrap();
+    assert_eq!(r.rows[0].values[0], Value::IntervalYm(IntervalYm::new(-1, -2)));
+
+    // cast 的目标精度会落在结果上（参数描述是推荐类型，绑定用值自己的 scale）。
+    let r = c.query("select cast(? as interval year(3) to month) from dual", &[IntervalYm::new(1, 2).into()]).await.unwrap();
+    assert_eq!(
+        r.rows[0].values[0],
+        Value::IntervalYm(IntervalYm { years: 1, months: 2, lead_prec: 3, frac_prec: 6, qualifier: IntervalQual::YearToMonth })
+    );
+
+    recreate(
+        &mut c,
+        "T_RS_INTERVAL",
+        "id int primary key, \
+         ym interval year to month, \
+         y interval year(3), \
+         m interval month(4), \
+         dt interval day to second, \
+         d interval day(2), \
+         h interval hour(3), \
+         mi interval minute(4), \
+         s interval second(5,2), \
+         dh interval day(2) to hour, \
+         dm interval day(3) to minute, \
+         ds interval day(4) to second(3), \
+         hm interval hour(2) to minute, \
+         hs interval hour(3) to second(1), \
+         ms interval minute(4) to second(5)",
+    )
+    .await;
+    let row = vec![
+        Value::Int(1),
+        IntervalYm { years: 1, months: 2, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::YearToMonth }.into(),
+        IntervalYm { years: -100, months: 0, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::Year }.into(),
+        IntervalYm { years: 0, months: 15, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::Month }.into(),
+        IntervalDt { days: -3, hours: -4, minutes: -5, seconds: -6, nanos: -789_123_000, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::DayToSecond }.into(),
+        IntervalDt { days: 3, lead_prec: 9, qualifier: IntervalQual::Day, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { hours: 4, lead_prec: 9, qualifier: IntervalQual::Hour, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { minutes: 5, lead_prec: 9, qualifier: IntervalQual::Minute, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { seconds: -6, nanos: -780_000_000, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::Second, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { days: 3, hours: 4, lead_prec: 9, qualifier: IntervalQual::DayToHour, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { days: 3, hours: 4, minutes: 5, lead_prec: 9, qualifier: IntervalQual::DayToMinute, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { days: 3, hours: 4, minutes: 5, seconds: 6, nanos: 789_000_000, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::DayToSecond }.into(),
+        IntervalDt { hours: 4, minutes: 5, lead_prec: 9, qualifier: IntervalQual::HourToMinute, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { hours: 4, minutes: 5, seconds: 6, nanos: 700_000_000, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::HourToSecond, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { minutes: 5, seconds: 6, nanos: 789_120_000, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::MinuteToSecond, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+    ];
+    // 写入时值自带的前导精度是 9；列定义会把它收成列的精度。
+    let expect = vec![
+        Value::Int(1),
+        IntervalYm { years: 1, months: 2, lead_prec: 2, frac_prec: 6, qualifier: IntervalQual::YearToMonth }.into(),
+        IntervalYm { years: -100, months: 0, lead_prec: 3, frac_prec: 6, qualifier: IntervalQual::Year }.into(),
+        IntervalYm { years: 0, months: 15, lead_prec: 4, frac_prec: 6, qualifier: IntervalQual::Month }.into(),
+        IntervalDt { days: -3, hours: -4, minutes: -5, seconds: -6, nanos: -789_123_000, lead_prec: 2, frac_prec: 6, qualifier: IntervalQual::DayToSecond }.into(),
+        IntervalDt { days: 3, lead_prec: 2, qualifier: IntervalQual::Day, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { hours: 4, lead_prec: 3, qualifier: IntervalQual::Hour, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { minutes: 5, lead_prec: 4, qualifier: IntervalQual::Minute, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { seconds: -6, nanos: -780_000_000, lead_prec: 5, frac_prec: 2, qualifier: IntervalQual::Second, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { days: 3, hours: 4, lead_prec: 2, qualifier: IntervalQual::DayToHour, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { days: 3, hours: 4, minutes: 5, lead_prec: 3, qualifier: IntervalQual::DayToMinute, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { days: 3, hours: 4, minutes: 5, seconds: 6, nanos: 789_000_000, lead_prec: 4, frac_prec: 3, qualifier: IntervalQual::DayToSecond }.into(),
+        IntervalDt { hours: 4, minutes: 5, lead_prec: 2, qualifier: IntervalQual::HourToMinute, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { hours: 4, minutes: 5, seconds: 6, nanos: 700_000_000, lead_prec: 3, frac_prec: 1, qualifier: IntervalQual::HourToSecond, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+        IntervalDt { minutes: 5, seconds: 6, nanos: 789_120_000, lead_prec: 4, frac_prec: 5, qualifier: IntervalQual::MinuteToSecond, ..IntervalDt::new(0, 0, 0, 0, 0) }.into(),
+    ];
+    c.execute("insert into T_RS_INTERVAL values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &row).await.unwrap();
+    let mut nulls = vec![Value::Int(2)];
+    nulls.extend(std::iter::repeat(Value::Null).take(14));
+    c.execute("insert into T_RS_INTERVAL values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &nulls).await.unwrap();
+    let r = c.query("select * from T_RS_INTERVAL order by id", &[]).await.unwrap();
+    assert_eq!(r.rows[0].values, expect);
+    assert!(r.rows[1].values[1..].iter().all(|v| v.is_null()), "{:?}", r.rows[1].values);
+    // 列描述的 scale 与值内 scale 字相同。
+    let scales: Vec<i32> = expect.iter().skip(1).map(|v| if let Some(i) = v.as_interval_ym() { i.scale_word() } else { v.as_interval_dt().unwrap().scale_word() }).collect();
+    assert_eq!(r.columns.iter().skip(1).map(|c| c.scale).collect::<Vec<_>>(), scales);
+
+    // 前导精度放不下时服务端拒绝。
+    let overflow = c
+        .execute(
+            "insert into T_RS_INTERVAL(id, y) values(?, ?)",
+            &[Value::Int(3), IntervalYm { years: 1000, months: 0, lead_prec: 3, frac_prec: 6, qualifier: IntervalQual::Year }.into()],
+        )
+        .await;
+    assert!(overflow.is_err(), "{overflow:?}");
+    c.execute("drop table T_RS_INTERVAL", &[]).await.unwrap();
+}
+
+#[tokio::test]
 async fn schema_option_and_meta() {
     let mut o = opts();
     o.schema = Some("SYSDBA".into());

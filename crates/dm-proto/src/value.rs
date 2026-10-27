@@ -262,18 +262,233 @@ fn enc_time(t: &Time, nano: bool, out: &mut Vec<u8>) {
     }
 }
 
+/// INTERVAL 的 qualifier。数值是值字节 scale 字里的 qualifier 字节（§11.2.3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IntervalQual {
+    Year = 0,
+    YearToMonth = 1,
+    Month = 2,
+    Day = 3,
+    DayToHour = 4,
+    DayToMinute = 5,
+    DayToSecond = 6,
+    Hour = 7,
+    HourToMinute = 8,
+    HourToSecond = 9,
+    Minute = 10,
+    MinuteToSecond = 11,
+    Second = 12,
+}
+
+impl IntervalQual {
+    pub fn is_ym(self) -> bool {
+        (self as u8) <= Self::Month as u8
+    }
+    pub fn is_dt(self) -> bool {
+        !self.is_ym()
+    }
+    /// 文本里是否带小数秒（SECOND 结尾的限定符）。
+    fn has_seconds_field(self) -> bool {
+        matches!(self, Self::DayToSecond | Self::HourToSecond | Self::MinuteToSecond | Self::Second)
+    }
+}
+
+impl TryFrom<u8> for IntervalQual {
+    type Error = ProtoError;
+    fn try_from(v: u8) -> Result<Self> {
+        Ok(match v {
+            0 => Self::Year,
+            1 => Self::YearToMonth,
+            2 => Self::Month,
+            3 => Self::Day,
+            4 => Self::DayToHour,
+            5 => Self::DayToMinute,
+            6 => Self::DayToSecond,
+            7 => Self::Hour,
+            8 => Self::HourToMinute,
+            9 => Self::HourToSecond,
+            10 => Self::Minute,
+            11 => Self::MinuteToSecond,
+            12 => Self::Second,
+            _ => return Err(ProtoError::Invalid(format!("interval qualifier {v}"))),
+        })
+    }
+}
+
+/// INTERVAL YEAR / MONTH / YEAR TO MONTH。
+///
+/// 负间隔的 `years` 与 `months` 同为负或零。`lead_prec` 为前导精度（1..=9）；
+/// `frac_prec` 是 scale 低 4 位，年月类型在服务端恒为 6。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntervalYm {
     pub years: i32,
     pub months: i32,
+    pub lead_prec: u8,
+    pub frac_prec: u8,
+    pub qualifier: IntervalQual,
 }
+
+/// INTERVAL DAY / HOUR / MINUTE / SECOND 及其 TO 组合。
+///
+/// `nanos` 为小数秒（纳秒）。线上只保留到微秒，编码时向零截断到 1000 纳秒的倍数。
+/// 负间隔的各字段同为负或零。`lead_prec` 1..=9，`frac_prec` 0..=6。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntervalDt {
     pub days: i32,
     pub hours: i32,
     pub minutes: i32,
     pub seconds: i32,
-    pub fraction: i32,
+    pub nanos: i32,
+    pub lead_prec: u8,
+    pub frac_prec: u8,
+    pub qualifier: IntervalQual,
+}
+
+impl IntervalYm {
+    /// `INTERVAL year-month YEAR(9) TO MONTH`（字面量的默认前导精度是 9）。
+    pub fn new(years: i32, months: i32) -> Self {
+        Self { years, months, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::YearToMonth }
+    }
+    pub fn year(years: i32) -> Self {
+        Self { years, months: 0, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::Year }
+    }
+    pub fn month(months: i32) -> Self {
+        Self { years: 0, months, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::Month }
+    }
+    pub fn scale_word(self) -> i32 {
+        pack_interval_scale(self.lead_prec, self.frac_prec, self.qualifier).unwrap_or(-1)
+    }
+}
+
+impl IntervalDt {
+    /// `INTERVAL day hour:minute:second.fraction DAY(9) TO SECOND(6)`。
+    pub fn new(days: i32, hours: i32, minutes: i32, seconds: i32, nanos: i32) -> Self {
+        Self { days, hours, minutes, seconds, nanos, lead_prec: 9, frac_prec: 6, qualifier: IntervalQual::DayToSecond }
+    }
+    pub fn scale_word(self) -> i32 {
+        pack_interval_scale(self.lead_prec, self.frac_prec, self.qualifier).unwrap_or(-1)
+    }
+}
+
+/// `scale = qualifier<<8 | lead_prec<<4 | frac_prec`（高 16 位为 0）。
+fn pack_interval_scale(lead: u8, frac: u8, q: IntervalQual) -> Result<i32> {
+    if lead > 0xF || frac > 0xF {
+        return Err(ProtoError::Convert(format!("interval precision lead={lead} frac={frac} does not fit in 4 bits")));
+    }
+    Ok(((q as i32) << 8) | ((lead as i32) << 4) | (frac as i32))
+}
+
+fn unpack_interval_scale(scale: i32) -> Result<(u8, u8, IntervalQual)> {
+    let u = scale as u32;
+    let lead = ((u >> 4) & 0xF) as u8;
+    let frac = (u & 0xF) as u8;
+    let q = IntervalQual::try_from(((u >> 8) & 0xFF) as u8)?;
+    Ok((lead, frac, q))
+}
+
+fn interval_neg(parts: &[i32]) -> bool {
+    parts.iter().any(|p| *p < 0)
+}
+
+fn interval_num(n: i32) -> String {
+    n.unsigned_abs().to_string()
+}
+
+/// 小数秒按 frac_prec 位输出（线上是微秒，最多 6 位；更长则补 0）。
+fn interval_frac_digits(nanos: i32, prec: u8) -> String {
+    let micros = nanos.unsigned_abs() / 1000;
+    let mut digits = format!("{micros:06}");
+    let n = prec as usize;
+    if n > digits.len() {
+        digits.extend(std::iter::repeat('0').take(n - digits.len()));
+    } else {
+        digits.truncate(n);
+    }
+    digits
+}
+
+fn interval_qual_sql(q: IntervalQual, lead: u8, frac: u8) -> String {
+    match q {
+        IntervalQual::Year => format!("YEAR({lead})"),
+        IntervalQual::Month => format!("MONTH({lead})"),
+        IntervalQual::YearToMonth => format!("YEAR({lead}) TO MONTH"),
+        IntervalQual::Day => format!("DAY({lead})"),
+        IntervalQual::Hour => format!("HOUR({lead})"),
+        IntervalQual::Minute => format!("MINUTE({lead})"),
+        IntervalQual::Second => format!("SECOND({lead}, {frac})"),
+        IntervalQual::DayToHour => format!("DAY({lead}) TO HOUR"),
+        IntervalQual::DayToMinute => format!("DAY({lead}) TO MINUTE"),
+        IntervalQual::DayToSecond => format!("DAY({lead}) TO SECOND({frac})"),
+        IntervalQual::HourToMinute => format!("HOUR({lead}) TO MINUTE"),
+        IntervalQual::HourToSecond => format!("HOUR({lead}) TO SECOND({frac})"),
+        IntervalQual::MinuteToSecond => format!("MINUTE({lead}) TO SECOND({frac})"),
+    }
+}
+
+fn fmt_interval(sign_parts: &[i32], body: &str, q: IntervalQual, lead: u8, frac: u8) -> String {
+    let sign = if interval_neg(sign_parts) { "-" } else { "" };
+    format!("INTERVAL {sign}'{body}' {}", interval_qual_sql(q, lead, frac))
+}
+
+impl fmt::Display for IntervalYm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (neg, body) = match self.qualifier {
+            IntervalQual::Year => (self.years < 0, interval_num(self.years)),
+            IntervalQual::Month => (self.months < 0, interval_num(self.months)),
+            _ => (self.years < 0 || self.months < 0, format!("{}-{}", interval_num(self.years), interval_num(self.months))),
+        };
+        let sign = if neg { "-" } else { "" };
+        write!(f, "INTERVAL {sign}'{body}' {}", interval_qual_sql(self.qualifier, self.lead_prec, self.frac_prec))
+    }
+}
+
+impl fmt::Display for IntervalDt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sec = |out: &mut String| {
+            out.push_str(&interval_num(self.seconds));
+            if self.qualifier.has_seconds_field() && self.frac_prec > 0 {
+                out.push('.');
+                out.push_str(&interval_frac_digits(self.nanos, self.frac_prec));
+            }
+        };
+        let (parts, body) = match self.qualifier {
+            IntervalQual::Day => (vec![self.days], interval_num(self.days)),
+            IntervalQual::Hour => (vec![self.hours], interval_num(self.hours)),
+            IntervalQual::Minute => (vec![self.minutes], interval_num(self.minutes)),
+            IntervalQual::Second => {
+                let mut b = String::new();
+                sec(&mut b);
+                (vec![self.seconds, self.nanos], b)
+            }
+            IntervalQual::DayToHour => (vec![self.days, self.hours], format!("{} {}", interval_num(self.days), interval_num(self.hours))),
+            IntervalQual::DayToMinute => {
+                (vec![self.days, self.hours, self.minutes], format!("{} {}:{}", interval_num(self.days), interval_num(self.hours), interval_num(self.minutes)))
+            }
+            IntervalQual::DayToSecond => {
+                let mut b = format!("{} {}:{}:", interval_num(self.days), interval_num(self.hours), interval_num(self.minutes));
+                sec(&mut b);
+                (vec![self.days, self.hours, self.minutes, self.seconds, self.nanos], b)
+            }
+            IntervalQual::HourToMinute => (vec![self.hours, self.minutes], format!("{}:{}", interval_num(self.hours), interval_num(self.minutes))),
+            IntervalQual::HourToSecond => {
+                let mut b = format!("{}:{}:", interval_num(self.hours), interval_num(self.minutes));
+                sec(&mut b);
+                (vec![self.hours, self.minutes, self.seconds, self.nanos], b)
+            }
+            IntervalQual::MinuteToSecond => {
+                let mut b = format!("{}:", interval_num(self.minutes));
+                sec(&mut b);
+                (vec![self.minutes, self.seconds, self.nanos], b)
+            }
+            _ => {
+                let mut b = format!("{} {}:{}:", interval_num(self.days), interval_num(self.hours), interval_num(self.minutes));
+                sec(&mut b);
+                (vec![self.days, self.hours, self.minutes, self.seconds, self.nanos], b)
+            }
+        };
+        f.write_str(&fmt_interval(&parts, &body, self.qualifier, self.lead_prec, self.frac_prec))
+    }
 }
 
 // ---------- LOB ----------
@@ -347,6 +562,8 @@ from_impl!(Decimal, Decimal);
 from_impl!(Date, Date);
 from_impl!(Time, Time);
 from_impl!(DateTime, DateTime);
+from_impl!(IntervalYm, IntervalYm);
+from_impl!(IntervalDt, IntervalDt);
 impl From<&str> for Value {
     fn from(x: &str) -> Self {
         Value::String(x.to_string())
@@ -365,6 +582,37 @@ impl From<&[u8]> for Value {
 impl From<Bytes> for Value {
     fn from(x: Bytes) -> Self {
         Value::Bytes(x)
+    }
+}
+
+impl TryFrom<&Value> for IntervalYm {
+    type Error = ProtoError;
+    fn try_from(v: &Value) -> Result<Self> {
+        match v {
+            Value::IntervalYm(i) => Ok(*i),
+            _ => Err(ProtoError::Convert(format!("cannot convert {v:?} to interval year to month"))),
+        }
+    }
+}
+impl TryFrom<Value> for IntervalYm {
+    type Error = ProtoError;
+    fn try_from(v: Value) -> Result<Self> {
+        IntervalYm::try_from(&v)
+    }
+}
+impl TryFrom<&Value> for IntervalDt {
+    type Error = ProtoError;
+    fn try_from(v: &Value) -> Result<Self> {
+        match v {
+            Value::IntervalDt(i) => Ok(*i),
+            _ => Err(ProtoError::Convert(format!("cannot convert {v:?} to interval day to second"))),
+        }
+    }
+}
+impl TryFrom<Value> for IntervalDt {
+    type Error = ProtoError;
+    fn try_from(v: Value) -> Result<Self> {
+        IntervalDt::try_from(&v)
     }
 }
 impl<T: Into<Value>> From<Option<T>> for Value {
@@ -411,6 +659,18 @@ impl Value {
             _ => None,
         }
     }
+    pub fn as_interval_ym(&self) -> Option<&IntervalYm> {
+        match self {
+            Value::IntervalYm(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub fn as_interval_dt(&self) -> Option<&IntervalDt> {
+        match self {
+            Value::IntervalDt(v) => Some(v),
+            _ => None,
+        }
+    }
     /// 文本表示（NULL 返回 None）。
     pub fn to_text(&self) -> Option<String> {
         Some(match self {
@@ -428,8 +688,8 @@ impl Value {
             Value::Date(d) => d.to_string(),
             Value::Time(t) => t.to_string(),
             Value::DateTime(t) => t.to_string(),
-            Value::IntervalYm(i) => format!("{}-{}", i.years, i.months),
-            Value::IntervalDt(i) => format!("{} {}:{}:{}.{}", i.days, i.hours, i.minutes, i.seconds, i.fraction),
+            Value::IntervalYm(i) => i.to_string(),
+            Value::IntervalDt(i) => i.to_string(),
             Value::Lob(_) => "<lob>".into(),
         })
     }
@@ -459,8 +719,8 @@ impl Value {
             Value::Date(_) => (DATE, 3, 0),
             Value::Time(t) => if t.tz.is_some() { (TIME_TZ, 7, 6) } else { (TIME, 5, 6) },
             Value::DateTime(t) => if t.time.tz.is_some() { (DATETIME_TZ, 10, 6) } else { (DATETIME, 8, 6) },
-            Value::IntervalYm(_) => (INTERVAL_YM, 12, 0),
-            Value::IntervalDt(_) => (INTERVAL_DT, 24, 0),
+            Value::IntervalYm(i) => (INTERVAL_YM, 12, i.scale_word()),
+            Value::IntervalDt(i) => (INTERVAL_DT, 24, i.scale_word()),
             Value::Lob(_) => (BLOB, 0, 0),
         }
     }
@@ -597,16 +857,29 @@ pub fn decode_value(c: &ColumnCtx, data: Bytes, enc: Encoding) -> Result<Value> 
             Value::DateTime(DateTime { date: dec_date(b), time: t })
         }
         INTERVAL_YM => {
-            need(b, 8, "interval ym")?;
+            need(b, 12, "interval ym")?;
+            let (lead, frac, qualifier) = unpack_interval_scale(i32::from_le_bytes(b[8..12].try_into().unwrap()))?;
+            if !qualifier.is_ym() {
+                return Err(ProtoError::Invalid(format!("interval year-month qualifier {qualifier:?}")));
+            }
             Value::IntervalYm(IntervalYm {
                 years: i32::from_le_bytes(b[0..4].try_into().unwrap()),
                 months: i32::from_le_bytes(b[4..8].try_into().unwrap()),
+                lead_prec: lead,
+                frac_prec: frac,
+                qualifier,
             })
         }
         INTERVAL_DT => {
-            need(b, 20, "interval dt")?;
+            need(b, 24, "interval dt")?;
             let g = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-            Value::IntervalDt(IntervalDt { days: g(0), hours: g(4), minutes: g(8), seconds: g(12), fraction: g(16) })
+            let (lead, frac, qualifier) = unpack_interval_scale(g(20))?;
+            if !qualifier.is_dt() {
+                return Err(ProtoError::Invalid(format!("interval day-time qualifier {qualifier:?}")));
+            }
+            let micros = g(16);
+            let nanos = micros.checked_mul(1000).ok_or_else(|| ProtoError::Invalid(format!("interval fraction {micros} us overflows")))?;
+            Value::IntervalDt(IntervalDt { days: g(0), hours: g(4), minutes: g(8), seconds: g(12), nanos, lead_prec: lead, frac_prec: frac, qualifier })
         }
         BLOB | CLOB => Value::Lob(decode_lob(&data, c.col_type == CLOB, c.new_lob, c.lob_tab_id, c.lob_col_id)?),
         t => return Err(ProtoError::Unsupported(format!("column type {t}"))),
@@ -619,7 +892,14 @@ fn conv<T: TryFrom<i64>>(v: &Value, what: &str) -> Result<T> {
 }
 
 /// 把值编码为目标服务端类型的字节（NULL 由调用方处理）。
+/// INTERVAL 的 scale 字取自值本身。
 pub fn encode_value(v: &Value, ty: i32, enc: Encoding) -> Result<Vec<u8>> {
+    encode_value_with_scale(v, ty, None, enc)
+}
+
+/// 同 [`encode_value`]。`scale` 仅用于 INTERVAL：`Some` 时写入该 scale 字
+///（参数绑定用，与参数描述里的 scale 保持一致），`None` 时用值自带的精度与 qualifier。
+pub fn encode_value_with_scale(v: &Value, ty: i32, scale: Option<i32>, enc: Encoding) -> Result<Vec<u8>> {
     let bad = || ProtoError::Convert(format!("cannot convert {v:?} to server type {ty}"));
     Ok(match ty {
         BIT | BOOLEAN => vec![match v {
@@ -681,8 +961,59 @@ pub fn encode_value(v: &Value, ty: i32, enc: Encoding) -> Result<Vec<u8>> {
             }
             o
         }
+        INTERVAL_YM => {
+            let Value::IntervalYm(iv) = v else { return Err(bad()) };
+            encode_interval_ym(iv, scale)?
+        }
+        INTERVAL_DT => {
+            let Value::IntervalDt(iv) = v else { return Err(bad()) };
+            encode_interval_dt(iv, scale)?
+        }
         t => return Err(ProtoError::Unsupported(format!("parameter type {t}"))),
     })
+}
+
+fn interval_scale_for(scale: Option<i32>, lead: u8, frac: u8, q: IntervalQual, ym: bool) -> Result<i32> {
+    match scale {
+        Some(s) => {
+            if s < 0 {
+                return Err(ProtoError::Convert(format!("invalid interval scale {s}")));
+            }
+            let (_, _, qual) = unpack_interval_scale(s)?;
+            if qual.is_ym() != ym {
+                return Err(ProtoError::Convert(format!("interval scale {s:#x} qualifier {qual:?} does not match the target type")));
+            }
+            Ok(s)
+        }
+        None => {
+            if q.is_ym() != ym {
+                return Err(ProtoError::Convert(format!("interval qualifier {q:?} does not match the target type")));
+            }
+            pack_interval_scale(lead, frac, q)
+        }
+    }
+}
+
+fn encode_interval_ym(iv: &IntervalYm, scale: Option<i32>) -> Result<Vec<u8>> {
+    let scale = interval_scale_for(scale, iv.lead_prec, iv.frac_prec, iv.qualifier, true)?;
+    let mut o = Vec::with_capacity(12);
+    o.extend_from_slice(&iv.years.to_le_bytes());
+    o.extend_from_slice(&iv.months.to_le_bytes());
+    o.extend_from_slice(&scale.to_le_bytes());
+    Ok(o)
+}
+
+fn encode_interval_dt(iv: &IntervalDt, scale: Option<i32>) -> Result<Vec<u8>> {
+    let scale = interval_scale_for(scale, iv.lead_prec, iv.frac_prec, iv.qualifier, false)?;
+    let micros = iv.nanos / 1000;
+    let mut o = Vec::with_capacity(24);
+    o.extend_from_slice(&iv.days.to_le_bytes());
+    o.extend_from_slice(&iv.hours.to_le_bytes());
+    o.extend_from_slice(&iv.minutes.to_le_bytes());
+    o.extend_from_slice(&iv.seconds.to_le_bytes());
+    o.extend_from_slice(&micros.to_le_bytes());
+    o.extend_from_slice(&scale.to_le_bytes());
+    Ok(o)
 }
 
 fn time_bytes(t: &Time, tz: bool) -> Vec<u8> {
@@ -769,6 +1100,69 @@ mod tests {
         assert_eq!(encode_value(&"héllo".into(), VARCHAR, enc).unwrap(), "héllo".as_bytes());
         let ctx = ColumnCtx { col_type: VARCHAR, new_lob: true, lob_tab_id: 0, lob_col_id: 0 };
         assert_eq!(decode_value(&ctx, Bytes::from("héllo"), enc).unwrap(), Value::String("héllo".into()));
+    }
+
+    #[test]
+    fn interval_wire_and_display() {
+        let enc = Encoding::Utf8;
+        let ctx_ym = ColumnCtx { col_type: INTERVAL_YM, new_lob: true, lob_tab_id: 0, lob_col_id: 0 };
+        let ctx_dt = ColumnCtx { col_type: INTERVAL_DT, new_lob: true, lob_tab_id: 0, lob_col_id: 0 };
+
+        let ym = IntervalYm::new(1, 2);
+        assert_eq!(ym.scale_word(), 406);
+        assert_eq!(ym.to_string(), "INTERVAL '1-2' YEAR(9) TO MONTH");
+        let b = encode_value(&ym.into(), INTERVAL_YM, enc).unwrap();
+        assert_eq!(b, [1, 0, 0, 0, 2, 0, 0, 0, 0x96, 1, 0, 0]);
+        assert_eq!(decode_value(&ctx_ym, Bytes::from(b), enc).unwrap(), Value::IntervalYm(ym));
+
+        let neg_ym = IntervalYm { years: -100, months: -11, lead_prec: 3, frac_prec: 6, qualifier: IntervalQual::YearToMonth };
+        assert_eq!(neg_ym.to_string(), "INTERVAL -'100-11' YEAR(3) TO MONTH");
+        let b = encode_value(&neg_ym.into(), INTERVAL_YM, enc).unwrap();
+        assert_eq!(b, [0x9c, 0xff, 0xff, 0xff, 0xf5, 0xff, 0xff, 0xff, 0x36, 1, 0, 0]);
+        assert_eq!(decode_value(&ctx_ym, Bytes::from(b), enc).unwrap().as_interval_ym(), Some(&neg_ym));
+
+        let year = IntervalYm { lead_prec: 2, ..IntervalYm::year(1) };
+        assert_eq!(year.to_string(), "INTERVAL '1' YEAR(2)");
+        assert_eq!(encode_value(&year.into(), INTERVAL_YM, enc).unwrap()[8..], [0x26, 0, 0, 0]);
+
+        let dt = IntervalDt::new(3, 4, 5, 6, 789_000_000);
+        assert_eq!(dt.to_string(), "INTERVAL '3 4:5:6.789000' DAY(9) TO SECOND(6)");
+        assert_eq!(dt.scale_word(), 1686);
+        let b = encode_value(&dt.into(), INTERVAL_DT, enc).unwrap();
+        assert_eq!(
+            b,
+            vec![3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, 0x08, 0x0a, 0x0c, 0x00, 0x96, 0x06, 0, 0]
+        );
+        assert_eq!(decode_value(&ctx_dt, Bytes::from(b), enc).unwrap(), Value::IntervalDt(dt));
+
+        let neg_dt = IntervalDt { days: -3, hours: -4, minutes: -5, seconds: -6, nanos: -789_000_000, ..IntervalDt::new(0, 0, 0, 0, 0) };
+        assert_eq!(neg_dt.to_string(), "INTERVAL -'3 4:5:6.789000' DAY(9) TO SECOND(6)");
+        let b = encode_value(&neg_dt.into(), INTERVAL_DT, enc).unwrap();
+        assert_eq!(&b[..20], &[-3i32, -4, -5, -6, -789_000].into_iter().flat_map(|n| n.to_le_bytes()).collect::<Vec<_>>());
+
+        // 纳秒向零截断到微秒。
+        let trunc = IntervalDt::new(0, 0, 0, 1, 1_500);
+        let b = encode_value(&trunc.into(), INTERVAL_DT, enc).unwrap();
+        let back = IntervalDt::try_from(decode_value(&ctx_dt, Bytes::from(b), enc).unwrap()).unwrap();
+        assert_eq!(back.nanos, 1_000);
+
+        // 绑定到列时用列的 scale 覆盖值自带的精度。
+        let stamped = encode_value_with_scale(&Value::IntervalYm(IntervalYm::new(1, 2)), INTERVAL_YM, Some(294), enc).unwrap();
+        assert_eq!(&stamped[8..12], &294i32.to_le_bytes());
+        let back = IntervalYm::try_from(decode_value(&ctx_ym, Bytes::from(stamped), enc).unwrap()).unwrap();
+        assert_eq!(back, IntervalYm { years: 1, months: 2, lead_prec: 2, frac_prec: 6, qualifier: IntervalQual::YearToMonth });
+
+        let sec = IntervalDt { seconds: 6, nanos: 789_123_000, lead_prec: 2, frac_prec: 6, qualifier: IntervalQual::Second, ..IntervalDt::new(0, 0, 0, 0, 0) };
+        assert_eq!(sec.to_string(), "INTERVAL '6.789123' SECOND(2, 6)");
+        let sec0 = IntervalDt { seconds: 6, nanos: 0, lead_prec: 5, frac_prec: 0, qualifier: IntervalQual::Second, ..IntervalDt::new(0, 0, 0, 0, 0) };
+        assert_eq!(sec0.to_string(), "INTERVAL '6' SECOND(5, 0)");
+        let us = IntervalDt { nanos: -1_000, qualifier: IntervalQual::Second, ..IntervalDt::new(0, 0, 0, 0, 0) };
+        assert_eq!(us.to_string(), "INTERVAL -'0.000001' SECOND(9, 6)");
+
+        assert!(encode_value(&Value::IntervalYm(ym), INTERVAL_DT, enc).is_err());
+        assert!(encode_value(&Value::Int(1), INTERVAL_YM, enc).is_err());
+        assert!(decode_value(&ctx_ym, Bytes::from(vec![0; 11]), enc).is_err());
+        assert!(IntervalDt::try_from(Value::IntervalYm(ym)).is_err());
     }
 
     #[test]

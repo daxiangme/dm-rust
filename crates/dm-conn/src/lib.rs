@@ -13,4 +13,4 @@ pub use dm_proto::Value;
 pub use error::{BatchRowError, Error, Result};
 pub use options::{CompressAlgo, Compression, ConnectOptions, IsolationLevel};
 pub use param::{rewrite_jdbc_call, CallResult, OutValue, Param, TypeHint};
-pub use row::{ExecResult, QueryResult, Row, StatementInfo};
+pub use row::{ExecResult, MultiResult, QueryResult, ResultSet, Row, StatementInfo};

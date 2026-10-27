@@ -565,3 +565,90 @@ async fn call_out_inout_and_refcursor() {
 
     drop_call_objs(&mut c).await;
 }
+
+/// 多语句结果集：SELECT 批走 NEXT_RESULT；DML 不拆成多项；空结果集保留；宽行触发 FETCH。
+#[tokio::test]
+async fn multi_result_sets() {
+    let mut c = conn!();
+    let _ = c.execute("drop table T_RS_MULTI", &[]).await;
+    c.execute("create table T_RS_MULTI(id int, s varchar(20))", &[]).await.unwrap();
+
+    let one = c.query_multi("select 1 as a from dual", &[]).await.unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one.results[0].as_query().unwrap().rows[0].get_by_name("a"), Some(&Value::Int(1)));
+
+    let sql = "select 1 as a from dual; select 2 as b, '雪' as c from dual; select 3 as d from dual where 1 = 0";
+    let q = c.query(sql, &[]).await.unwrap();
+    assert_eq!(q.rows.len(), 1);
+    assert_eq!(q.rows[0].get_by_name("a"), Some(&Value::Int(1)));
+    assert_eq!(q.columns.len(), 1);
+
+    let m = c.query_multi(sql, &[]).await.unwrap();
+    assert_eq!(m.len(), 3, "{m:?}");
+    assert_eq!(m.results[0].as_query().unwrap().rows[0].values[0], Value::Int(1));
+    let b = m.results[1].as_query().unwrap();
+    assert_eq!(b.rows[0].get_by_name("b"), Some(&Value::Int(2)));
+    assert_eq!(b.rows[0].get_by_name("c"), Some(&Value::String("雪".into())));
+    let empty = m.results[2].as_query().expect("empty select is still a result set");
+    assert!(empty.rows.is_empty(), "{empty:?}");
+    assert_eq!(empty.columns.len(), 1);
+    assert!(m.results.iter().all(|r| r.as_update().is_none()));
+
+    let m = c.query_multi("select ? as a from dual; select ? as b from dual", &[Value::Int(7), Value::Int(8)]).await.unwrap();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m.results[0].as_query().unwrap().rows[0].values[0], Value::Int(7));
+    assert_eq!(m.results[1].as_query().unwrap().rows[0].values[0], Value::Int(8));
+
+    // 第二结果集约 80×400 个汉字，首包放不下，剩下的靠 FETCH（结果集 id 0）补齐。
+    let wide = "select 1 as a from dual; select level as id, rpad('汉', 400, '汉') as s from dual connect by level <= 80";
+    let m = c.query_multi(wide, &[]).await.unwrap();
+    assert_eq!(m.len(), 2, "{:?}", m.results.iter().map(|r| r.as_query().map(|q| q.rows.len())).collect::<Vec<_>>());
+    let rows = &m.results[1].as_query().unwrap().rows;
+    assert_eq!(rows.len(), 80);
+    assert_eq!(rows[0].get_by_name("id"), Some(&Value::Int(1)));
+    assert_eq!(rows[79].get_by_name("id"), Some(&Value::Int(80)));
+    // 本实例 LENGTH_IN_CHAR=0：rpad('汉', 400, '汉') 的 LENGTH 是 200、LENGTHB 是 600，仍会把第二结果集拆成两包。
+    let s = rows[40].get_by_name("s").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(s.chars().count(), 200);
+    assert!(s.chars().all(|ch| ch == '汉'));
+
+    let n = c.execute("insert into T_RS_MULTI values(1, 'a'); insert into T_RS_MULTI values(2, 'b'); update T_RS_MULTI set s = 'u'", &[]).await.unwrap();
+    assert_eq!(n.rows_affected, 2, "last statement updates 2 rows, got {n:?}");
+    let seen = c.query("select id, s from T_RS_MULTI order by id", &[]).await.unwrap();
+    assert_eq!(seen.rows.len(), 2);
+    assert!(seen.rows.iter().all(|r| r.get_by_name("s") == Some(&Value::String("u".into()))), "{:?}", seen.rows);
+
+    let m = c.query_multi("insert into T_RS_MULTI values(3, 'c'); update T_RS_MULTI set s = 'z' where id >= 1", &[]).await.unwrap();
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!(m.results[0].as_update().unwrap().rows_affected, 3);
+
+    let m = c.query_multi("select 9 as n from dual; update T_RS_MULTI set s = 'q' where id = 1; select id, s from T_RS_MULTI where id = 1", &[]).await.unwrap();
+    assert_eq!(m.len(), 2, "{m:?}");
+    assert_eq!(m.results[0].as_query().unwrap().rows[0].values[0], Value::Int(9));
+    assert_eq!(m.results[1].as_query().unwrap().rows[0].get_by_name("s"), Some(&Value::String("q".into())));
+
+    let m = c.query_multi("select 4 as a from dual; insert into T_RS_MULTI values(4, 'i')", &[]).await.unwrap();
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!(m.results[0].as_query().unwrap().rows[0].values[0], Value::Int(4));
+    let chk = c.query("select s from T_RS_MULTI where id = 4", &[]).await.unwrap();
+    assert_eq!(chk.rows[0].values[0], Value::String("i".into()));
+
+    let m = c.query_multi("begin null; end;", &[]).await.unwrap();
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!(m.results[0].as_update().map(|e| e.rows_affected), Some(0));
+
+    let batch = c.execute_batch("insert into T_RS_MULTI values(?, ?)", &[vec![10.into(), "b".into()], vec![11.into(), "b".into()]]).await.unwrap();
+    assert_eq!(batch.rows_affected, 2);
+    assert_eq!(batch.batch_counts, vec![1, 1]);
+
+    let e = c.execute("declare c sys_refcursor; begin open c for select 1 as a from dual; dbms_sql.return_result(c); end;", &[]).await.unwrap_err();
+    match e {
+        Error::Server { code, message } => {
+            assert_eq!(code, -2193, "{message}");
+            assert!(message.contains("RETURN_RESULT"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    c.ping().await.unwrap();
+    c.execute("drop table T_RS_MULTI", &[]).await.unwrap();
+}

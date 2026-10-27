@@ -9,7 +9,7 @@
 | crate | 内容 |
 |---|---|
 | `dm-proto` | 无 IO 的协议编解码：帧读写（`Bytes` 零拷贝）、STARTUP/LOGIN/PREPARE/EXEC/FETCH/LOB 等消息、DH + 对称加密（DES/3DES/AES/RC4 × ECB/CBC/CFB/OFB）、zlib/snappy 压缩、XOR/CRC32 校验、值类型编解码（DECIMAL/日期时间/时区/INTERVAL/LOB 头…） |
-| `dm-conn` | tokio 异步连接：握手（含 rustls TLS）、登录、语句缓存（LRU）、`query/execute/execute_batch`、存储过程 `call`（OUT/INOUT/`SYS_REFCURSOR`）、事务、隔离级别、LOB 读写、压缩/整报文加密、取消安全（future 被丢弃后连接标记为 broken） |
+| `dm-conn` | tokio 异步连接：握手（含 rustls TLS）、登录、语句缓存（LRU）、`query/execute/execute_batch`、`query_multi`（多结果集）、存储过程 `call`（OUT/INOUT/`SYS_REFCURSOR`）、事务、隔离级别、LOB 读写、压缩/整报文加密、取消安全（future 被丢弃后连接标记为 broken） |
 | `dm-pool` | 连接池：信号量限流、LIFO 空闲复用、idle/lifetime 过期、取出时 ping、事务中/损坏连接归还时丢弃 |
 
 ## 用法
@@ -40,6 +40,14 @@ assert_eq!(f.outs[0].as_value(), Some(&dm_conn::Value::Int(5)));
 let cur = c.call("begin p_rows(?, ?); end;", &[dm_conn::Param::In(10.into()), dm_conn::Param::out_cursor()]).await?;
 let rows = cur.outs[0].as_cursor().unwrap();
 assert_eq!(rows.rows.len(), 10);
+
+// 多结果集。一条 SQL 里用分号隔开的多个 SELECT，query_multi 用 NEXT_RESULT 依次取回。
+// query / execute 仍然只解释第一份响应。0 行的 SELECT 也占一项。
+// 本机 DM8 8.1.4.6 没有 DBMS_SQL.RETURN_RESULT；纯 DML 批只有一条更新计数（最后一条语句的行数）。
+let multi = c.query_multi("select 1 as a from dual; select ? as b from dual", &[2.into()]).await?;
+assert_eq!(multi.results.len(), 2);
+assert_eq!(multi.results[0].as_query().unwrap().rows[0].get_by_name("a"), Some(&dm_conn::Value::Int(1)));
+assert_eq!(multi.results[1].as_query().unwrap().rows[0].get_by_name("b"), Some(&dm_conn::Value::Int(2)));
 ```
 
 示例：`cargo run -p dm-conn --example basic|tx_batch`，`cargo run -p dm-pool --example pool`。

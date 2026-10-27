@@ -383,7 +383,15 @@ itemFlag：1 自增、2 LOB、4 只读。列修饰：
 ### 10.4 NEXT_RESULT(44)
 请求 @20 i16 = 结果集 id；响应同 EXEC 响应（§9.2），是否有结果集看 retSqlType/列数。
 
+顺序取下一个时 @20 写 **0**。写 **从 1 起的序号**会按绝对位置重读对应结果（1 是第一个）。序号超出实际个数时服务端返回 **-6006（无效消息）**，这是普通错误响应，连接还可以继续用。第一份 EXECUTE 响应里没有“后面还有结果”的标志位（多语句 SELECT 的 @59 为 0），客户端要自己发 NEXT_RESULT，直到结束。
+
+结束与空结果集（实测，见 §16 第 19 条）：
+- 没有更多结果：返回码 **+111**（警告，不是失败），sql type = 0，无列。body 是错误包布局，消息为「结果集数据获取完成」。
+- 这个结果集本身是 0 行：返回码 **+100**，sql type 仍是 162，列描述还在，行数为 0。这是一项结果，后面的 NEXT_RESULT 仍可能取出后续结果集。
+
 REF CURSOR（实测，见 §16 第 18 条）：EXECUTE 响应只带第一个游标。之后对同一 stmt 发 NEXT_RESULT，@20 写 0 取下一个游标；再写 0 则 retSqlType=0 且无列，表示结束。直接写 1、2 会重新读取对应游标（从 1 起）。取游标后续行时 FETCH 的结果集 id 用 0（当前结果集），起始行号为已经收到的行数。
+
+多条 SELECT 写在同一条 SQL 里（`select ...; select ...`，PREPARE+EXECUTE 与直接执行都一样）时，EXECUTE 只带第一个结果集，其余用 NEXT_RESULT(@20=0) 按顺序取。当前结果集没取完的行用 FETCH，结果集 id 为 0。DML 不会各自成为一项结果。细节见 §16 第 19 条。
 
 ## 11. 值编码（服务端类型码与字节表示）
 
@@ -498,7 +506,7 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
 
 ## 12. 返回码与错误包
 
-- 包头 @10 = 返回码 `code`。`code < 0` 且 `code ≠ EC_RN_EXCEED_ROWSET_SIZE` → 错误；`code > 0` 为警告（忽略）；`EC_RN_EXCEED_ROWSET_SIZE` 是“需要继续 fetch”的信号，不是错误。
+- 包头 @10 = 返回码 `code`。`code < 0` 且 `code ≠ EC_RN_EXCEED_ROWSET_SIZE` → 错误；`code > 0` 为警告（请求仍然成功，帧要照常解析）；`EC_RN_EXCEED_ROWSET_SIZE` 是“需要继续 fetch”的信号，不是错误。多结果集上两个警告有固定含义：`+100` 是空结果集，`+111` 是没有更多结果集（§10.4、§16 第 19 条）。其它正数没有单独解释。
 - 错误包 body（自 @64）：`i32 n1`+跳过 n1 字节；`i32 n2`+跳过 n2 字节；`i32 n3`+跳过 n3 字节；然后 `i32 长度`+**错误消息字符串**（服务端编码；EUC-KR 在中文环境下按 GB18030 解码）。`[待实测：三段跳过区在真实服务器的内容]`
 - 常见错误码（节选，负数；以实测为准）：-2501 语法错误、-2106 无效对象、-6602 用户名或密码错误 等。
 - 批量错误码 `EC_BP_WITH_ERROR`（§9.2）。
@@ -549,7 +557,7 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
 13. **登录 schema**：登录请求不带 schema 时，服务端会话的当前模式为用户名同名模式；客户端本地记录的"当前模式"在为空时取 `upper(user)`。
 14. **错误包**：布局（三段跳过区 + 长度前缀的消息）与 §12 一致；消息为服务端字符集（UTF-8 实例下为 UTF-8 中文）。登录失败返回的错误码与普通错误包同格式。
 15. **已验证的值类型往返**：TINYINT/SMALLINT/INT/BIGINT、FLOAT/DOUBLE、DECIMAL（含 38 位）、CHAR/VARCHAR（含中文）、BINARY/VARBINARY、DATE/TIME/TIMESTAMP、TIME/TIMESTAMP WITH TIME ZONE、BLOB/CLOB、BIT/BOOLEAN、NULL、INTERVAL YEAR TO MONTH 与 INTERVAL DAY TO SECOND（全部 qualifier，含精度、负值、NULL、绑定参数）。本地时区列未专门测试。
-16. **未验证**：CRC32 模式、GB18030/EUC-KR 实例、BDTA（服务端要求时直接报错）、一条 SQL 里的多个 SELECT 结果集（REF CURSOR 的 NEXT_RESULT 已核实，见第 18 条）、复杂类型（ARRAY/记录/类）、LOB 的 OUT 参数、DBMS_OUTPUT、DM 集群/读写分离、SM4/RSA 等扩展加密、IPv6。INTERVAL 的 qualifier 与 scale 布局已核实，见第 17 条。存储过程 OUT/INOUT、函数返回值与 `SYS_REFCURSOR` 已核实，见第 18 条。
+16. **未验证**：CRC32 模式、GB18030/EUC-KR 实例、BDTA（服务端要求时直接报错）、复杂类型（ARRAY/记录/类）、LOB 的 OUT 参数、DBMS_OUTPUT、DM 集群/读写分离、SM4/RSA 等扩展加密、IPv6。INTERVAL 的 qualifier 与 scale 布局已核实，见第 17 条。存储过程 OUT/INOUT、函数返回值与 `SYS_REFCURSOR` 已核实，见第 18 条。一条 SQL 里的多个 SELECT、以及本版本能否用 `DBMS_SQL.RETURN_RESULT` 造出隐式结果集，已核实，见第 19 条。
 17. **INTERVAL 值编码**（§11.2.3 的实测依据，DM8 8.1.4.6）：
     - `INTERVAL '1-2' YEAR TO MONTH` 的 12 字节为 `01 00 00 00  02 00 00 00  96 01 00 00`（年=1，月=2，scale=0x0196=406：lead=9，frac=6，qualifier=1）。`INTERVAL '-1-2' YEAR TO MONTH` 的年、月均为负数（`ff ff ff ff  fe ff ff ff`），scale 不变。
     - `INTERVAL '1' YEAR(2)` 的 scale 低字节为 `0x26`（lead=2，frac=6，qualifier=0）；`MONTH(4)` 为 qualifier=2。列 `interval year to month`（未写精度）的 scale=0x0126=294（lead=2；字面量默认 lead=9）。
@@ -562,4 +570,14 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
     - **EXECUTE 请求**。ioType 必须与 PREPARE 的 0/1/2 一致。把真实 OUT 按 ioType 0 发送并写入值，曾导致 dmserver **SIGSEGV（signal 11）**，会话被拆掉；方向不一致时客户端不得发送 EXECUTE。每个参数先写 13 字节描述（`u8 ioType, i32 colType, i32 prec, i32 scale`），再按顺序写值：IN 与 INOUT 写 `u16 长度 + 字节` 或 NULL 的 `u16 0xFFFE`；OUT 与 CURSOR **省略值字节**（不是 NULL 标记，也不是 `i32 4` + stmt id）。后者会得到 `cmd 13 validate error!` 并断开连接。示例（IN=3、OUT INT、INOUT=4、IN 字符串 `你好`、OUT VARCHAR、INOUT `xy`、IN/INOUT 日期 2024-02-28、OUT INT）的值区是 `04 00 03 00 00 00  04 00 04 00 00 00  06 00 e4 bd a0 e5 a5 bd  02 00 78 79  03 00 e8 07 e1  03 00 e8 07 e1`。三个 CURSOR 的请求在描述之后只有 IN 的 `04 00 78 00 00 00`（整数 120），没有游标载荷。
     - **EXECUTE 响应**。retSqlType=162，@22 列数在没有游标时为 0，@32 是 OUT+INOUT 的个数（不含纯 IN）。值区按这个顺序，编码与 §11.2 相同。上面那次调用的 body 是 `04 00 0d 00 00 00`（13）、`04 00 07 00 00 00`（7）、`0a 00` + UTF-8 `你好-out`、`05 00` + `xy-io`、`03 00 e8 07 e9`（2024-02-29）、同样的日期、`fe ff`（NULL）。IN 为 NULL 的 INT/VARCHAR/DATE INOUT，以及被赋成 NULL 的 OUT，响应都是 `fe ff`。函数 `f(20, 22)` 的返回值 body 是 `04 00 2a 00 00 00`（42），@32=1；`f(NULL, 1)` 的 body 只有 `fe ff`。
     - **REF CURSOR**。每个游标在 OUT 区占一个 `fe ff`。第一个游标的列描述和行紧跟在这些 OUT 值后面（retSqlType=162，@22 为列数，@35 为本包行数，@24 为总行数）。120 行、两列（INT + 字符串）的游标整包都在 EXECUTE 响应里：@24=120，@32=3，@35=120，body 以 `fe ff fe ff fe ff` 开始，然后是列描述和行。标量 OUT 与 CURSOR 在同一次调用里时，标量仍是长度前缀的值，游标槽仍是 `fe ff`：INT 结果 9 加一个游标时，body 以 `04 00 09 00 00 00 fe ff` 开始。第二个、第三个游标不在这个包里，要对同一 stmt 发 **NEXT_RESULT(44)**，@20=0。第二包：sql type 162、列数 1、@24=3、@32=0、@35=3，列名 `ID`、类型名 `INTEGER`。空游标（`open c for select 1 as id from dual where 2 = 3`）：sql type 162、1 列、@24=0、@35=0，只有列描述、没有行。两个游标都取完后再发 NEXT_RESULT(@20=0)，响应 sql type=0 且无列。FETCH 的结果集 id 用 0 表示当前游标，起始行号是已经收到的行数；这次 120 行没有拆包。另一次探测里，NEXT_RESULT 之后用 FETCH start=40、rs id=0 能继续读到当前游标的后续行；对已经整包返回的游标再 FETCH、start 超出总行数时，得到 **-7036** 且 body 为空，按结果集结束处理（查询游标耗尽时的 -2002 见第 3 条）。
-    - **未在这次确认的**：PREPARE ioType=-1 的真实语句、LOB OUT、一条 SQL 中的多个 SELECT、把游标按 stmt id 编码的任何成功变体。
+    - **未在这次确认的**：PREPARE ioType=-1 的真实语句、LOB OUT、把游标按 stmt id 编码的任何成功变体。一条 SQL 中的多个 SELECT 见第 19 条。
+19. **多结果集与 NEXT_RESULT(44)**（DM8 8.1.4.6）。第一份 EXECUTE / 直接执行响应里看不到“还有下一个”的标志；@59 在这些 SELECT 批上是 0。客户端对同一 stmt 发 NEXT_RESULT，@20=0 表示下一个，直到结束。
+    - **多条 SELECT**。`select 1 as a from dual; select 2 as b, '雪' as c from dual; select 3 as d from dual where 1=0`：PREPARE 的 sql type=162、0 列、0 参数。EXECUTE 只带第一项（sql type 162、列 `A`、值 1）。第一次 NEXT_RESULT(@20=0) 是列 `B`/`C`、值 2 与 `雪`。第二次是空结果集：返回码 **+100**、sql type 162、1 列、@24=0、@35=0，没有行。第三次返回码 **+111**、sql type 0、无列，body 按 §12 的错误包布局，消息「结果集数据获取完成」。`+100` 和 `+111` 都是正数警告，连接保持可用。直接执行（命令 5、@21=1）与 PREPARE 再 EXECUTE 的拆分方式相同。单条 `select 1 as a from dual` 的 EXECUTE sql type 是 160，紧接着的 NEXT_RESULT(@20=0) 就是 +111。
+    - **参数**。`?` 按整段文本从左到右编号。`select ? as a from dual; select ? as b from dual` 绑定 7、8，两个结果集分别是 7 和 8。只给第一句占位符时，`select ? as a from dual; select 9 as b from dual` 绑定 7，第二项是字面量 9。
+    - **空结果集不是结束**。`select 1 as a from dual where 1=0; select 2 as b from dual` 的第一包就是 +100、有列、0 行；下一次 NEXT_RESULT 才是值为 2 的结果集。
+    - **DML 不拆开**。`insert ...; update ...; delete ...` 三条都执行了（插入的行能再被更新、再被删掉），但响应只有一包：sql type 162、0 列、0 行，@24 等于**最后一条**语句的影响行数（这次 delete 删 1 行，@24=1；不是三条之和 5，也不是中间那条 update 的 3）。再 NEXT_RESULT 就是 +111。`select ...; update ...; select ...` 与 `select ...; insert ...` 只交出 SELECT 结果集，DML 的影响行数不单独出现；数据修改仍然发生。存储过程里连续三条 DML 同样只有这一个计数（再调用一次、最后的 delete 影响 0 行时，@24=0）。`begin null; end;` 是 sql type 162、0 列、@24=0，然后 +111。
+    - **批量参数不是多项结果**。`insert` 两行参数的 EXECUTE：sql type 157，@24=2，@59=0x87。bit0 与 bit1 仍是逐行计数 `[1, 1]` 和自增 id；bit2 与 bit7 也是 1，按 §9.2 只读 bit0/bit1 就能得到这两段列表，没有再多出要读的字段。紧接着的 NEXT_RESULT(@20=0) 是 +111，不会按参数行再给结果。
+    - **FETCH**。本实例 `LENGTH_IN_CHAR=0`。`rpad('汉', 400, '汉')` 的 `LENGTH` 是 200、`LENGTHB` 是 600，不是 400 个字符。第二项这样的字符串 × 80 行：NEXT_RESULT 包 @24=80、@35=52。随后 FETCH，结果集 id=0、start=52，返回总行数 80、本包 28 行。再 NEXT_RESULT 才是 +111。行数较少的项（180 行、250 行的整数列）整包返回，@24=@35。
+    - **序号重读**。多语句 SELECT 执行之后，NEXT_RESULT @20=2 直接给出第二项，@20=1 给出第一项。只有两项时 @20=3 返回 **-6006（无效消息）**。同一连接上随后的其它语句仍然成功。单条 SELECT（sql type 160）在已经收到 +111 之后再写 @20=1，这次仍是 +111，没有把那一行再送出来。顺序消费只用 @20=0。
+    - **不取后续结果**。同一 stmt 上 EXECUTE 之后不发 NEXT_RESULT，再次 EXECUTE 仍从第一项开始（值正确）。期间另一条 `select 99 from dual` 也正常。所以 `query` / `execute` 可以只解释第一包。
+    - **`DBMS_SQL.RETURN_RESULT` 在这个版本不存在**。`ALL_PROCEDURES` 里 `DBMS_SQL` 有 PARSE、EXECUTE、FETCH_ROWS、TO_REFCURSOR、TO_CURSOR_NUMBER、BIND_VARIABLE、DEFINE_COLUMN 等，没有 `RETURN_RESULT`。匿名块 `open c for select 1 as a from dual; dbms_sql.return_result(c);` 返回 **-2193（无效的方法名[RETURN_RESULT]）**。`create procedure` 把这段正文放进去时，协议层执行成功，PRINT 文本是同一条 -2193，对象处于无效状态；再 `begin` 调用返回 **-7160（对象处于无效状态）**。这个版本用隐式结果集这条路径产不出多结果集。显式 `SYS_REFCURSOR` OUT 参数仍按第 18 条。

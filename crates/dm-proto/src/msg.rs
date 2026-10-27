@@ -821,6 +821,17 @@ pub fn next_result_request(stmt_id: i32, rs_id: i16) -> BytesMut {
     w.finish()
 }
 
+/// 结果集有列但 0 行。正数，不是结束，响应体仍是普通 EXEC 结果。
+pub const RC_RESULT_EMPTY: i32 = 100;
+/// 没有更多结果集。正数，body 为错误包布局，消息「结果集数据获取完成」。
+pub const RC_RESULT_END: i32 = 111;
+
+/// NEXT_RESULT 走到头：返回码 +111，或 sql type 为 0（REF CURSOR 取完时也是 0）。
+/// `+100` 配 sql type 160/162 是空结果集，不是结束。
+pub fn no_more_results(ret_code: i32, sql_type: i16) -> bool {
+    ret_code == RC_RESULT_END || sql_type == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,5 +984,39 @@ mod tests {
         assert!(er.out_params[1].is_none());
         assert!(er.columns.is_empty());
         assert!(er.rows.is_empty());
+    }
+
+    #[test]
+    fn next_result_layout_and_end_marker() {
+        let f = frame_of(next_result_request(9, 0));
+        assert_eq!(f.cmd(), CMD_NEXT_RESULT);
+        assert_eq!(f.stmt_id(), 9);
+        assert_eq!(f.i16_at(20).unwrap(), 0);
+        assert_eq!(f.i32_at(6).unwrap(), 0);
+        let f = frame_of(next_result_request(9, 2));
+        assert_eq!(f.i16_at(20).unwrap(), 2);
+        assert!(no_more_results(RC_RESULT_END, 0));
+        assert!(no_more_results(0, 0));
+        assert!(!no_more_results(RC_RESULT_EMPTY, SQL_SELECT2));
+        assert!(!no_more_results(0, SQL_SELECT));
+        assert!(!no_more_results(0, SQL_SELECT2));
+        assert!(!no_more_results(0, SQL_INSERT));
+    }
+
+    #[test]
+    fn exec_response_update_count_without_columns() {
+        // 多条 DML 拼成一条 SQL 时，响应 sql type 仍是 162，但没有列、没有行，@24 是更新计数。
+        let mut w = Writer::new(CMD_EXECUTE, 3);
+        w.set_i16(20, SQL_SELECT2);
+        w.set_u16(22, 0);
+        w.set_i64(24, 2);
+        let f = frame_of(w.finish());
+        let er = ExecResponse::parse(&f, Encoding::Utf8, false, &[]).unwrap();
+        assert_eq!(er.sql_type, SQL_SELECT2);
+        assert!(er.columns.is_empty());
+        assert!(er.rows.is_empty());
+        assert!(!er.columns_from_response);
+        assert_eq!(er.update_count, 2);
+        assert!(!no_more_results(0, er.sql_type));
     }
 }

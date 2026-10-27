@@ -1,7 +1,7 @@
 use crate::error::{BatchRowError, Error, Result};
 use crate::options::{CompressAlgo, Compression, ConnectOptions, IsolationLevel};
 use crate::param::{rewrite_jdbc_call, CallResult, OutValue, Param};
-use crate::row::{ExecResult, QueryResult, Row, StatementInfo};
+use crate::row::{ExecResult, MultiResult, QueryResult, ResultSet, Row, StatementInfo};
 use crate::stream::Stream;
 use bytes::{Bytes, BytesMut};
 use dm_proto::codec::Codec;
@@ -449,6 +449,17 @@ impl Connection {
     }
 
     async fn run_stmt(&mut self, sql: &str, st: &CachedStmt, rows: &[Vec<Value>]) -> Result<Outcome> {
+        let f = self.send_exec(st, rows).await?;
+        let er = ExecResponse::parse(&f, self.enc, st.base_name, &st.columns)?;
+        self.outcome_of(sql, st, er, true).await
+    }
+
+    /// 有列或有行才是结果集。sql type 162 且列、行都空时是更新计数（多语句 DML、匿名块），不是空查询。
+    fn is_row_result(er: &ExecResponse) -> bool {
+        is_select(er.sql_type) && (!er.columns.is_empty() || !er.rows.is_empty())
+    }
+
+    async fn send_exec(&mut self, st: &CachedStmt, rows: &[Vec<Value>]) -> Result<Frame> {
         if st.params.iter().any(|p| p.io_type == 1 || p.io_type == 2 || p.col_type == CURSOR) {
             return Err(Error::Other("statement has OUT, INOUT, or REF CURSOR parameters; use Connection::call".into()));
         }
@@ -474,12 +485,16 @@ impl Connection {
             return Err(Error::Batch(errs.into_iter().map(|e| BatchRowError { row: e.row, code: e.code, message: e.message }).collect()));
         }
         trace!("exec raw: {:02x?}", &f.data[..]);
-        let er = ExecResponse::parse(&f, self.enc, st.base_name, &st.columns)?;
+        Ok(f)
+    }
+
+    async fn outcome_of(&mut self, sql: &str, st: &CachedStmt, er: ExecResponse, update_cache: bool) -> Result<Outcome> {
         self.update_tx(&er);
-        if is_select(er.sql_type) {
+        if Self::is_row_result(&er) {
             let cols = Arc::new(er.columns.clone());
-            if er.columns_from_response {
-                // 服务端在计划重编译/首次执行时会在 EXECUTE 响应里给出最终列类型，更新缓存
+            if update_cache && er.columns_from_response {
+                // 服务端在计划重编译/首次执行时会在 EXECUTE 响应里给出最终列类型，更新缓存。
+                // 多结果集只缓存第一份；后续结果各自带列描述。
                 if let Some(c) = self.cache.get_mut(sql) {
                     if c.id == st.id {
                         c.columns = cols.clone();
@@ -496,6 +511,34 @@ impl Connection {
                 print_msg: er.print_msg,
             }))
         }
+    }
+
+    /// 从 EXECUTE 响应起，用 NEXT_RESULT(@20=0) 取完后续结果，直到返回码 +111 或 sql type 0。
+    async fn collect_results(&mut self, sql: &str, st: &CachedStmt, rows: &[Vec<Value>]) -> Result<MultiResult> {
+        let mut frame = self.send_exec(st, rows).await?;
+        let mut results = Vec::new();
+        let mut print_msg = String::new();
+        let mut update_cache = true;
+        loop {
+            if no_more_results(frame.ret_code(), frame.i16_at(20).unwrap_or(0)) {
+                break;
+            }
+            let er = ExecResponse::parse(&frame, self.enc, st.base_name, &st.columns)?;
+            if !er.print_msg.is_empty() {
+                if !print_msg.is_empty() {
+                    print_msg.push('\n');
+                }
+                print_msg.push_str(&er.print_msg);
+            }
+            let outcome = self.outcome_of(sql, st, er, update_cache).await?;
+            update_cache = false;
+            results.push(match outcome {
+                Outcome::Query(q) => ResultSet::Query(q),
+                Outcome::Exec(e) => ResultSet::Update(e),
+            });
+            frame = self.send_recv(next_result_request(st.id, 0), false).await?;
+        }
+        Ok(MultiResult { results, print_msg })
     }
 
     /// 把已经收到的行补全到结果集结束。`rs_id` 为 0 表示当前结果集（查询，以及 NEXT_RESULT 之后的 REF CURSOR）。
@@ -610,6 +653,42 @@ impl Connection {
             Outcome::Exec(e) => Ok(e),
             Outcome::Query(q) => Ok(ExecResult { rows_affected: q.rows.len() as i64, ..Default::default() }),
         }
+    }
+
+    /// 取回一次执行产生的全部结果集。
+    ///
+    /// 多个 `SELECT` 用分号写在同一条 SQL 里时，每个查询是一项 [`ResultSet::Query`]（包括 0 行）。
+    /// 本服务器上，夹在中间的 DML 会执行，但不会单独占一项；纯 DML 批只有一项 [`ResultSet::Update`]，
+    /// 影响行数是响应里的那一个计数（实测为最后一条语句的行数，不是逐条列表）。
+    /// 批量参数的逐行计数仍在 [`ExecResult::batch_counts`] 里，不走 NEXT_RESULT。
+    /// [`Connection::query`] / [`Connection::execute`] 只解释第一份响应，不向后取。
+    /// OUT、INOUT 与 `SYS_REFCURSOR` 仍用 [`Connection::call`]。
+    pub async fn query_multi(&mut self, sql: &str, params: &[Value]) -> Result<MultiResult> {
+        let mut retried = false;
+        loop {
+            let r = self.query_multi_once(sql, &[params.to_vec()]).await;
+            if !retried && matches!(&r, Err(Error::Server { code: -7009, .. })) {
+                retried = true;
+                continue;
+            }
+            return r;
+        }
+    }
+
+    async fn query_multi_once(&mut self, sql: &str, rows: &[Vec<Value>]) -> Result<MultiResult> {
+        let st = self.prepare_cached(sql).await?;
+        let r = self.collect_results(sql, &st, rows).await;
+        if let Err(e) = &r {
+            if matches!(e, Error::Server { .. }) {
+                if self.cache.get(sql).map(|c| c.id) == Some(st.id) {
+                    self.forget(sql);
+                }
+                self.free_stmt(st.id).await;
+                return r;
+            }
+        }
+        self.release_if_uncached(sql, &st).await;
+        r
     }
 
     pub async fn query_one(&mut self, sql: &str, params: &[Value]) -> Result<Option<Row>> {

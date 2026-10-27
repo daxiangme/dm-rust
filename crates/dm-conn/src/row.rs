@@ -47,3 +47,42 @@ pub struct StatementInfo {
     pub params: Vec<dm_proto::msg::ParamDesc>,
     pub columns: Vec<Column>,
 }
+
+/// 一次执行里的一项结果：查询行，或一条更新计数。
+#[derive(Debug, Clone)]
+pub enum ResultSet {
+    Query(QueryResult),
+    Update(ExecResult),
+}
+
+impl ResultSet {
+    pub fn as_query(&self) -> Option<&QueryResult> {
+        match self {
+            ResultSet::Query(q) => Some(q),
+            ResultSet::Update(_) => None,
+        }
+    }
+    pub fn as_update(&self) -> Option<&ExecResult> {
+        match self {
+            ResultSet::Update(e) => Some(e),
+            ResultSet::Query(_) => None,
+        }
+    }
+}
+
+/// [`crate::Connection::query_multi`] 的全部结果，顺序与服务端给出的一致。
+#[derive(Debug, Clone, Default)]
+pub struct MultiResult {
+    pub results: Vec<ResultSet>,
+    /// 各响应里的 PRINT 文本，按出现顺序用换行接起来。
+    pub print_msg: String,
+}
+
+impl MultiResult {
+    pub fn len(&self) -> usize {
+        self.results.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.results.is_empty()
+    }
+}

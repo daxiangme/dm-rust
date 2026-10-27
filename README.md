@@ -27,7 +27,7 @@ let r = c.query("select ? + 1 from dual", &[1.into()]).await?;
 ```
 cargo test --workspace                      # 离线单测 + 集成测试（连不上 127.0.0.1:5236 时集成测试自动跳过）
 DM_TEST_URL=dm://SYSDBA:SYSDBA001@host:5236 cargo test --workspace
-DM_DEBUG=1 ...                              # 打印原始帧，便于对照规格排错
+RUST_LOG=dm_conn=trace ...                  # 打印原始帧，便于对照规格排错（登录请求只输出命令号和长度）
 ```
 
 集成测试需要一个 DM8 实例，例如：

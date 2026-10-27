@@ -14,9 +14,11 @@ dm-proto = { path = "../dm-proto" }
 bytes.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -14,15 +14,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::{debug, trace};
 
 const DRIVER_VERSION: &str = "8.1.3.62";
 const CLIENT_MSG_VERSION: u16 = 8;
 const EC_RN_EXCEED_ROWSET_SIZE: i32 = -7036;
 const EC_BP_WITH_ERROR: i32 = 121;
 
-fn debug_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DM_DEBUG").is_some())
+/// 请求日志。LOGIN 变长区是用户名/密码（登录加密时为凭据密文），只记命令号和长度。
+fn log_req(req: &[u8]) {
+    let cmd = i16::from_le_bytes([req[4], req[5]]);
+    let len = req.len();
+    debug!(cmd, len, "req");
+    if cmd != CMD_LOGIN {
+        trace!("req head={:02x?}", &req[..len.min(100)]);
+    }
 }
 
 const LOB_INLINE_MAX: usize = 2048;
@@ -115,7 +121,8 @@ impl Connection {
         });
         let f = self.send_recv(req, true).await?;
         let sr = StartupResponse::parse(&f)?;
-        if debug_on() { eprintln!("startup resp: {:?}\nraw: {:02x?}", sr, &f.data[..]); }
+        debug!("startup resp: {sr:?}");
+        trace!("startup raw: {:02x?}", &f.data[..]);
         self.enc = sr.encoding;
         self.msg_version = sr.msg_version.min(CLIENT_MSG_VERSION);
         self.server_version = sr.server_version.clone();
@@ -165,7 +172,8 @@ impl Connection {
             host_name: b"",
         });
         let f = self.send_recv(req, false).await?;
-        if debug_on() { eprintln!("login raw: {:02x?}", &f.data[..]); }
+        // 登录响应不含口令；请求侧载荷已在 log_req 中省略。
+        trace!("login resp raw: {:02x?}", &f.data[..]);
         self.login = LoginResponse::parse(&f, enc)?;
         self.new_lob = self.login.new_lob;
         if self.login.schema.is_empty() {
@@ -221,7 +229,7 @@ impl Connection {
     }
 
     async fn roundtrip(&mut self, req: BytesMut, startup: bool) -> Result<Frame> {
-        if debug_on() { eprintln!("req cmd={} len={} head={:02x?}", i16::from_le_bytes([req[4], req[5]]), req.len(), &req[..req.len().min(100)]); }
+        log_req(&req);
         let data = if startup { Codec::default().encode(req)? } else { self.codec.encode(req)? };
         self.stream.write_all(&data).await?;
         self.stream.flush().await?;
@@ -451,7 +459,7 @@ impl Connection {
             let errs = parse_batch_errors(&f, self.enc)?;
             return Err(Error::Batch(errs.into_iter().map(|e| BatchRowError { row: e.row, code: e.code, message: e.message }).collect()));
         }
-        if debug_on() { eprintln!("exec raw: {:02x?}", &f.data[..]); }
+        trace!("exec raw: {:02x?}", &f.data[..]);
         let er = ExecResponse::parse(&f, self.enc, st.base_name, &st.columns)?;
         self.update_tx(&er);
         if is_select(er.sql_type) {
@@ -473,7 +481,8 @@ impl Connection {
                         break;
                     }
                     let req = fetch_request(st.id, got, self.opts.fetch_size, 0, 0);
-                    if debug_on() { eprintln!("fetch req: {:02x?} got={got} total={total} rip={}", &req[..], er.rows_in_packet); }
+                    debug!(got, total, rows_in_packet = er.rows_in_packet, "fetch");
+                    trace!("fetch req: {:02x?}", &req[..]);
                     let f = match self.send_recv(req, false).await {
                         Ok(f) => f,
                         // 游标耗尽后再取会返回 -2002（执行未准备SQL语句），视为结束

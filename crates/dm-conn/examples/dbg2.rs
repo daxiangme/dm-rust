@@ -1,6 +1,10 @@
 use dm_conn::{Connection, ConnectOptions, Value};
 #[tokio::main]
 async fn main() {
+    // 日志由 RUST_LOG 控制，例如 RUST_LOG=dm_conn=trace
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let o = ConnectOptions::from_url("dm://SYSDBA:SYSDBA001@127.0.0.1:5236").unwrap();
     let mut c = Connection::connect(&o).await.unwrap();
     let _ = c.execute("drop table T_DBG", &[]).await;

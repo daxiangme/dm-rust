@@ -82,15 +82,53 @@ pub struct StartupResponse {
 }
 
 impl StartupResponse {
+    /// 兼容解析：`client_msg_version` 为本端发出的消息版本。
+    /// 与官方驱动一致，是否含版本串由**协商后** MsgVersion = min(本端, 服务端) 判断，
+    /// 而不是服务端 @48 原值。变长区起点：新版本实测 @80，旧版本（如 DM8 08.00.00）可能为 @64，
+    /// 依次尝试并以“版本串合法 + 长度自洽”校验，选第一个成功的布局。
+    pub fn parse_with(f: &Frame, client_msg_version: u16) -> Result<Self> {
+        check_dm_frame(f, 200)?;
+        let msg_version = f.u16_at(48)?;
+        let neg = msg_version.min(client_msg_version);
+        let has_ver = neg < 21;
+        let mut first_err = None;
+        for &start in &[80usize, 64] {
+            match Self::parse_at(f, start, has_ver) {
+                Ok(v) => return Ok(v),
+                Err(e) => { first_err.get_or_insert(e); }
+            }
+        }
+        Err(first_err.unwrap())
+    }
+
     pub fn parse(f: &Frame) -> Result<Self> {
+        Self::parse_with(f, 8)
+    }
+
+    fn parse_at(f: &Frame, start: usize, has_ver: bool) -> Result<Self> {
         let key_flag = f.u8_at(40)?;
         let cipher_flag = f.u8_at(41)?;
         let msg_version = f.u16_at(48)?;
-        // 实测：STARTUP 响应的变长区从 @80 开始（@64..@79 为保留字段）
-        let mut r = Reader::new(f.data.clone(), 80);
-        let server_version = if msg_version < 21 { Some(r.i32_string(Encoding::Utf8)?) } else { None };
+        let mut r = Reader::new(f.data.clone(), start);
+        let server_version = if has_ver {
+            let v = r.i32_bytes()?;
+            if v.is_empty() || v.len() > 64 || !v.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'.' || *c == b'-' || *c == b' ') {
+                return Err(ProtoError::Invalid(format!("startup response: implausible server version at @{start}: {:02x?}", &v[..v.len().min(32)])));
+            }
+            Some(String::from_utf8_lossy(&v).into_owned())
+        } else {
+            None
+        };
         let cipher_id = if cipher_flag > 0 { Some(r.i32()?) } else { None };
-        let server_public = if key_flag > 0 { Some(r.i32_bytes()?) } else { None };
+        let server_public = if key_flag > 0 {
+            let k = r.i32_bytes()?;
+            if k.is_empty() || k.len() > 1024 {
+                return Err(ProtoError::Invalid(format!("startup response: implausible DH key length {}", k.len())));
+            }
+            Some(k)
+        } else {
+            None
+        };
         let hash_id = if cipher_flag == 2 { Some(r.i32()?) } else { None };
         Ok(StartupResponse {
             ssl_encrypt: f.i32_at(20)?,
@@ -108,6 +146,20 @@ impl StartupResponse {
             hash_id,
         })
     }
+}
+
+/// 粗检对端是否为 DM：包头 @6 的 body 长度应与实际一致。
+pub fn check_dm_frame(f: &Frame, expect_cmd: i16) -> Result<()> {
+    let body_len = f.i32_at(6)?;
+    let actual = f.data.len() as i64 - 64;
+    let _ = expect_cmd;
+    if body_len < 0 || (body_len as i64 != actual && body_len as i64 != actual - 4) {
+        return Err(ProtoError::Invalid(format!(
+            "peer does not look like a DM server (cmd={}, body_len={}, actual={}); check host/port",
+            f.cmd(), body_len, actual
+        )));
+    }
+    Ok(())
 }
 
 // ---------- LOGIN ----------
@@ -171,7 +223,15 @@ pub struct LoginResponse {
 }
 
 impl LoginResponse {
+    /// 变长区起点新版本 @80，旧版本可能 @64；依次尝试。
     pub fn parse(f: &Frame, enc: Encoding) -> Result<Self> {
+        match Self::parse_at(f, enc, 80) {
+            Ok(v) => Ok(v),
+            Err(e) => Self::parse_at(f, enc, 64).map_err(|_| e),
+        }
+    }
+
+    fn parse_at(f: &Frame, enc: Encoding, start: usize) -> Result<Self> {
         let standby = f.u8_at(42)? == 1;
         let ver_len = f.i32_at(55).unwrap_or(0);
         let mut out = LoginResponse {
@@ -188,7 +248,7 @@ impl LoginResponse {
             ..Default::default()
         };
         // 实测：LOGIN 响应的变长区从 @80 开始
-        let mut r = Reader::new(f.data.clone(), 80);
+        let mut r = Reader::new(f.data.clone(), start);
         out.instance_name = r.i32_string(enc)?;
         out.schema = r.i32_string(enc)?;
         let _last_ip = r.i32_bytes()?;

@@ -41,6 +41,10 @@ fn log_req(req: &[u8]) {
     }
 }
 
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 const LOB_INLINE_MAX: usize = 2048;
 const LOB_CHUNK: usize = 16000;
 
@@ -130,9 +134,12 @@ impl Connection {
             dh_public: dh.as_ref().map(|d| d.public_bytes()),
         });
         let f = self.send_recv(req, true).await?;
-        let sr = StartupResponse::parse(&f)?;
-        debug!("startup resp: {sr:?}");
         trace!("startup raw: {:02x?}", &f.data[..]);
+        let sr = StartupResponse::parse_with(&f, CLIENT_MSG_VERSION).map_err(|e| {
+            trace!("startup response parse failed: {e}; raw hex: {}", hex(&f.data));
+            e
+        })?;
+        debug!("startup resp: {sr:?}");
         self.enc = sr.encoding;
         self.msg_version = sr.msg_version.min(CLIENT_MSG_VERSION);
         self.server_version = sr.server_version.clone();
@@ -184,7 +191,10 @@ impl Connection {
         let f = self.send_recv(req, false).await?;
         // 登录响应不含口令；请求侧载荷已在 log_req 中省略。
         trace!("login resp raw: {:02x?}", &f.data[..]);
-        self.login = LoginResponse::parse(&f, enc)?;
+        self.login = LoginResponse::parse(&f, enc).map_err(|e| {
+            trace!("login response parse failed: {e}; raw hex: {}", hex(&f.data));
+            e
+        })?;
         self.new_lob = self.login.new_lob;
         if self.login.schema.is_empty() {
             self.login.schema = o.user.to_uppercase();

@@ -1,7 +1,7 @@
 # ShellAX 对象树元数据 SQL（DM8 实测）
 
-实测环境：本机 docker `dm8`（DM8 8.1.4.6，UTF-8 实例，SYSDBA 登录），驱动 dm-conn。
-测试：`crates/dm-conn/tests/metadata.rs`（`cargo test -p dm-conn --test metadata`）。
+实测环境：本机 docker `dm8`（DM8 8.1.4.6，UTF-8 实例，SYSDBA 登录），驱动 dm-rust。
+测试：`tests/metadata.rs`（`cargo test --test metadata`）。
 所有标识符默认大写存储，传参时用大写；`?` 为绑定参数。
 
 ## 1. 模式

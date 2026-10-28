@@ -215,63 +215,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "dm-conn"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "chrono",
- "dm-proto",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "dm-pool"
-version = "0.1.0"
-dependencies = [
- "dm-conn",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "dm-proto"
+name = "dm-rust"
 version = "0.1.0"
 dependencies = [
  "aes",
  "bytes",
+ "chrono",
  "cipher",
  "crc32fast",
  "des",
  "encoding_rs",
  "flate2",
+ "futures-core",
+ "futures-util",
+ "log",
  "md-5",
  "num-bigint",
  "num-traits",
  "rand",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "snap",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "dm-sqlx"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dm-conn",
- "dm-proto",
- "futures-core",
- "futures-util",
- "log",
  "sqlx-core",
+ "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

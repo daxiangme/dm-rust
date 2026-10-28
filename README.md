@@ -111,6 +111,7 @@ query("select 1 from dual").fetch_one(&mut *pooled).await?;
 ```
 cargo test --workspace                      # 离线单测 + 集成测试（连不上 127.0.0.1:5236 时集成测试自动跳过）
 DM_TEST_URL=dm://SYSDBA:SYSDBA001@host:5236 cargo test --workspace
+DM_TEST_GB_URL=dm://SYSDBA:SYSDBA001@host:5237 cargo test -p dm-conn --test gb18030   # GB18030 实例（UNICODE_FLAG=0）
 cargo test -p dm-sqlx --features sqlx       # sqlx 驱动；默认测试不打开这个 feature
 RUST_LOG=dm_conn=trace ...                  # 打印原始帧，便于对照规格排错（登录请求只输出命令号和长度）
 ```

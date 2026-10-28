@@ -527,7 +527,7 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
 
 ## 15. 字符编码
 
-- 服务端字符集由 startup @28 给出。UTF-8 实例（UNICODE_FLAG=1）全程使用 UTF-8；GB18030 实例使用 GB18030（本实现首版仅 UTF-8，GB18030 通过 `encoding_rs` 作为后续项）。
+- 服务端字符集由 startup @28 给出。UTF-8 实例（UNICODE_FLAG=1）全程使用 UTF-8；GB18030 实例使用 GB18030（`encoding_rs`，已实测，见 §16 第 21 条）。
 - 所有字符串字段（SQL、用户名、密码、错误信息）均按该编码。
 
 ## 16. 实测记录（DM8 8.1.4.6，Docker 镜像 dm8_20241022_rev244896，UTF-8，PAGE_SIZE=16）
@@ -557,7 +557,7 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
 13. **登录 schema**：登录请求不带 schema 时，服务端会话的当前模式为用户名同名模式；客户端本地记录的"当前模式"在为空时取 `upper(user)`。
 14. **错误包**：布局（三段跳过区 + 长度前缀的消息）与 §12 一致；消息为服务端字符集（UTF-8 实例下为 UTF-8 中文）。登录失败返回的错误码与普通错误包同格式。
 15. **已验证的值类型往返**：TINYINT/SMALLINT/INT/BIGINT、FLOAT/DOUBLE、DECIMAL（含 38 位）、CHAR/VARCHAR（含中文）、BINARY/VARBINARY、DATE/TIME/TIMESTAMP、TIME/TIMESTAMP WITH TIME ZONE、BLOB/CLOB、BIT/BOOLEAN、NULL、INTERVAL YEAR TO MONTH 与 INTERVAL DAY TO SECOND（全部 qualifier，含精度、负值、NULL、绑定参数）。本地时区列未专门测试。
-16. **未验证**：CRC32 模式、GB18030/EUC-KR 实例、BDTA（服务端要求时直接报错）、复杂类型（ARRAY/记录/类）、LOB 的 OUT 参数、DBMS_OUTPUT、DM 集群/读写分离、SM4/RSA 等扩展加密、IPv6。错误包里三段跳过区的内容仍是 `[待实测]`。外键约束与 CHECK 约束的错误码这次没有测。INTERVAL 的 qualifier 与 scale 布局已核实，见第 17 条。存储过程 OUT/INOUT、函数返回值与 `SYS_REFCURSOR` 已核实，见第 18 条。一条 SQL 里的多个 SELECT、以及本版本能否用 `DBMS_SQL.RETURN_RESULT` 造出隐式结果集，已核实，见第 19 条。列/参数 `nullable`、语法/登录/唯一/非空错误码、`IDENTITY` 回写，以及事务内的 SAVEPOINT SQL，已核实，见第 20 条。
+16. **未验证**：CRC32 模式、EUC-KR 实例、BDTA（服务端要求时直接报错）、复杂类型（ARRAY/记录/类）、LOB 的 OUT 参数、DBMS_OUTPUT、DM 集群/读写分离、SM4/RSA 等扩展加密、IPv6。错误包里三段跳过区的内容仍是 `[待实测]`。外键约束与 CHECK 约束的错误码这次没有测。INTERVAL 的 qualifier 与 scale 布局已核实，见第 17 条。存储过程 OUT/INOUT、函数返回值与 `SYS_REFCURSOR` 已核实，见第 18 条。一条 SQL 里的多个 SELECT、以及本版本能否用 `DBMS_SQL.RETURN_RESULT` 造出隐式结果集，已核实，见第 19 条。列/参数 `nullable`、语法/登录/唯一/非空错误码、`IDENTITY` 回写，以及事务内的 SAVEPOINT SQL，已核实，见第 20 条。
 17. **INTERVAL 值编码**（§11.2.3 的实测依据，DM8 8.1.4.6）：
     - `INTERVAL '1-2' YEAR TO MONTH` 的 12 字节为 `01 00 00 00  02 00 00 00  96 01 00 00`（年=1，月=2，scale=0x0196=406：lead=9，frac=6，qualifier=1）。`INTERVAL '-1-2' YEAR TO MONTH` 的年、月均为负数（`ff ff ff ff  fe ff ff ff`），scale 不变。
     - `INTERVAL '1' YEAR(2)` 的 scale 低字节为 `0x26`（lead=2，frac=6，qualifier=0）；`MONTH(4)` 为 qualifier=2。列 `interval year to month`（未写精度）的 scale=0x0126=294（lead=2；字面量默认 lead=9）。
@@ -586,3 +586,4 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
     - **错误码**（普通错误包，负数）。`selec 1` 为 **-2007**（第 1 行附近语法错误）。不存在的表为 **-2106**。错误密码与不存在的用户都是 **-2501**，消息为「用户名或密码错误」。主键或 UNIQUE 列重复为 **-6602**（违反唯一性约束）。`NOT NULL` 列不给值时为 **-6609**（违反非空约束）。外键与 CHECK 未测，不要把 -2501 当成语法错误，也不要把 -6602 当成登录失败。
     - **IDENTITY**。`id int identity(1,1) primary key` 插入一行（只写其它列）后，EXECUTE 响应的影响行数是 1，自增 id 列表是 `[1]`（响应里带了自增 id 标志时客户端才填这个列表）。即使写了列清单，`insert into t(id, s) values(1, 'b')` 在未执行 `SET IDENTITY_INSERT t ON` 时返回 **-2723**，消息为「仅当指定列列表，且SET IDENTITY_INSERT为ON时，才能对自增列赋值」。这不是唯一约束。
     - **SAVEPOINT 是 SQL，不是新命令号**。协议事务（`begin` 只把 auto_commit 置 0，`commit` / `rollback` 发 CMD_COMMIT=8 / CMD_ROLLBACK=9）里面可以执行 `SAVEPOINT`、`ROLLBACK TO SAVEPOINT`、`RELEASE SAVEPOINT`。一次测量：表里已有已提交的 1 行；事务内再插入 1 行、`SAVEPOINT`、再插入 1 行、`ROLLBACK TO SAVEPOINT` 之后 `count(*)` 为 2（已提交的 1 行 + 保存点之前的那一行）；`RELEASE SAVEPOINT` 成功；协议 `rollback` 之后 `count(*)` 回到 1。
+21. **GB18030 实例**（docker `UNICODE_FLAG=0`，DM8 8.1.4.6）：STARTUP 响应 @28 返回非 1/2 值，按 GB18030 编解码即可；SQL 文本、VARCHAR/CLOB 绑定与结果（含 >2048 字节的带外 CLOB）、中文表名/列名、注释、服务端中文错误消息、4 字节字符（扩展 B 区汉字、emoji）往返均正确；`lengthb('中文')=4`。测试：`crates/dm-conn/tests/gb18030.rs`（默认连 127.0.0.1:5237，连不上跳过）。

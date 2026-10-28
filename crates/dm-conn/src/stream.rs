@@ -77,14 +77,40 @@ pub(crate) mod tls {
         }
     }
 
-    pub fn connector() -> tokio_rustls::TlsConnector {
+    /// `verify=false`：接受任意证书（DM 默认自签证书时用）。
+    /// `verify=true`：校验证书链与服务器名；`ca_file` 给出时只信任其中的 CA，否则用系统根证书。
+    pub fn connector(verify: bool, ca_file: Option<&std::path::Path>) -> crate::error::Result<tokio_rustls::TlsConnector> {
+        use crate::error::Error;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-            .with_no_client_auth();
-        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .map_err(|e| Error::Tls(e.to_string()))?;
+        let cfg = if !verify {
+            builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerify(provider))).with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            if let Some(path) = ca_file {
+                let pem = std::fs::read(path).map_err(|e| Error::Tls(format!("read CA file {}: {e}", path.display())))?;
+                let mut n = 0;
+                for c in rustls_pemfile::certs(&mut &pem[..]) {
+                    let c = c.map_err(|e| Error::Tls(format!("parse CA file {}: {e}", path.display())))?;
+                    roots.add(c).map_err(|e| Error::Tls(format!("bad CA certificate in {}: {e}", path.display())))?;
+                    n += 1;
+                }
+                if n == 0 {
+                    return Err(Error::Tls(format!("no certificate found in {}", path.display())));
+                }
+            } else {
+                let r = rustls_native_certs::load_native_certs();
+                for c in r.certs {
+                    let _ = roots.add(c);
+                }
+                if roots.is_empty() {
+                    return Err(Error::Tls(format!("no system root certificates available ({:?}); set ssl_ca or ssl_verify=false", r.errors)));
+                }
+            }
+            builder.with_root_certificates(roots).with_no_client_auth()
+        };
+        Ok(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
     }
 }

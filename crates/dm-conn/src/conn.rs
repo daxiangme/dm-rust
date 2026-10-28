@@ -208,8 +208,14 @@ impl Connection {
                 return Ok(());
             }
         };
-        let name = ServerName::try_from(self.opts.host.clone()).unwrap_or_else(|_| ServerName::try_from("dameng").unwrap());
-        let t = crate::stream::tls::connector().connect(name, tcp).await.map_err(|e| Error::Tls(e.to_string()))?;
+        let host = self.opts.tls_server_name.clone().unwrap_or_else(|| self.opts.host.clone());
+        let name = match ServerName::try_from(host.clone()) {
+            Ok(n) => n,
+            Err(_) if !self.opts.tls_verify => ServerName::try_from("dameng").unwrap(),
+            Err(e) => return Err(Error::Tls(format!("invalid TLS server name {host:?}: {e}"))),
+        };
+        let connector = crate::stream::tls::connector(self.opts.tls_verify, self.opts.tls_ca_file.as_deref())?;
+        let t = connector.connect(name, tcp).await.map_err(|e| Error::Tls(e.to_string()))?;
         self.stream = Stream::Tls(Box::new(t));
         Ok(())
     }

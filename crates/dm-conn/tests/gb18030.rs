@@ -4,7 +4,7 @@ use dm_conn::{ConnectOptions, Connection, Encoding};
 
 #[tokio::test]
 async fn gb18030_instance_roundtrip() {
-    let url = std::env::var("DM_TEST_GB_URL").unwrap_or_else(|_| "dm://SYSDBA:SYSDBA001@127.0.0.1:5237".into());
+    let url = std::env::var("DM_TEST_GB_URL").unwrap_or_else(|_| "dm://SYSDBA:SYSDBA001@127.0.0.1:5237?ssl_verify=false".into());
     let mut c = match Connection::connect(&ConnectOptions::from_url(&url).unwrap()).await {
         Ok(c) => c,
         Err(e) => return eprintln!("skip: {e}"),

@@ -57,8 +57,12 @@ pub struct ConnectOptions {
     pub stmt_cache_capacity: usize,
     /// 每次 FETCH 的行数
     pub fetch_size: i64,
-    /// 服务端为 TLS 模式时是否校验证书（当前仅支持不校验）
+    /// 服务端为 TLS 模式时是否校验证书链和主机名（默认 true）。URL：`ssl_verify=false` 关闭。
     pub tls_verify: bool,
+    /// 额外信任的 CA 证书（PEM 文件，可含多张）。设置后只信任这些 CA，不再用系统根证书。URL：`ssl_ca=/path/ca.pem`。
+    pub tls_ca_file: Option<std::path::PathBuf>,
+    /// 校验用的服务器名（DNS 名或 IP）；默认用 `host`。URL：`ssl_server_name=db.example.com`。
+    pub tls_server_name: Option<String>,
 }
 
 impl ConnectOptions {
@@ -80,13 +84,19 @@ impl ConnectOptions {
             timezone_min: None,
             stmt_cache_capacity: 64,
             fetch_size: 1000,
-            tls_verify: false,
+            tls_verify: true,
+            tls_ca_file: None,
+            tls_server_name: None,
         }
     }
 
     /// 解析 `dm://user:password@host:port[/schema]`（用户名/密码支持 %XX 转义）。
     pub fn from_url(url: &str) -> Result<Self, String> {
         let rest = url.strip_prefix("dm://").ok_or("url must start with dm://")?;
+        let (rest, query) = match rest.split_once('?') {
+            Some((r, q)) => (r, Some(q)),
+            None => (rest, None),
+        };
         let (auth, hostpart) = rest.rsplit_once('@').ok_or("missing '@'")?;
         let (user, pass) = auth.split_once(':').ok_or("missing ':' in credentials")?;
         let (hostport, schema) = match hostpart.split_once('/') {
@@ -100,6 +110,22 @@ impl ConnectOptions {
         };
         let mut o = ConnectOptions::new(host, port, pct_decode(user), pct_decode(pass));
         o.schema = schema;
+        for kv in query.unwrap_or("").split('&').filter(|x| !x.is_empty()) {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            let v = pct_decode(v);
+            match k {
+                "ssl_verify" => {
+                    o.tls_verify = match v.to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" => true,
+                        "false" | "0" | "no" => false,
+                        _ => return Err(format!("invalid ssl_verify value {v:?}")),
+                    }
+                }
+                "ssl_ca" => o.tls_ca_file = Some(v.into()),
+                "ssl_server_name" => o.tls_server_name = Some(v),
+                _ => return Err(format!("unknown url parameter {k:?}")),
+            }
+        }
         Ok(o)
     }
 }
@@ -132,5 +158,13 @@ mod tests {
         assert_eq!(o.schema.as_deref(), Some("MYSCHEMA"));
         assert_eq!(ConnectOptions::from_url("dm://a:b@h").unwrap().port, 5236);
         assert!(ConnectOptions::from_url("mysql://a:b@h").is_err());
+        assert!(ConnectOptions::from_url("dm://a:b@h").unwrap().tls_verify);
+        let o = ConnectOptions::from_url("dm://a:b@h:1/S?ssl_verify=false&ssl_ca=%2Ftmp%2Fca.pem&ssl_server_name=db.local").unwrap();
+        assert!(!o.tls_verify);
+        assert_eq!(o.schema.as_deref(), Some("S"));
+        assert_eq!(o.tls_ca_file.as_deref(), Some(std::path::Path::new("/tmp/ca.pem")));
+        assert_eq!(o.tls_server_name.as_deref(), Some("db.local"));
+        assert!(ConnectOptions::from_url("dm://a:b@h?ssl_verify=maybe").is_err());
+        assert!(ConnectOptions::from_url("dm://a:b@h?foo=1").is_err());
     }
 }

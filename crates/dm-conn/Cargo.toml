@@ -7,7 +7,7 @@ description = "Async (tokio) Dameng DM8 client: connection, session, statement c
 
 [features]
 default = ["tls"]
-tls = ["dep:tokio-rustls", "dep:rustls"]
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs"]
 
 [dependencies]
 dm-proto = { path = "../dm-proto" }
@@ -17,6 +17,8 @@ tokio.workspace = true
 tracing.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 
 [dev-dependencies]

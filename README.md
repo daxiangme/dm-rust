@@ -112,6 +112,7 @@ query("select 1 from dual").fetch_one(&mut *pooled).await?;
 cargo test --workspace                      # 离线单测 + 集成测试（连不上 127.0.0.1:5236 时集成测试自动跳过）
 DM_TEST_URL=dm://SYSDBA:SYSDBA001@host:5236 cargo test --workspace
 DM_TEST_GB_URL=dm://SYSDBA:SYSDBA001@host:5237 cargo test -p dm-conn --test gb18030   # GB18030 实例（UNICODE_FLAG=0）
+DM_TEST_TLS_ADDR=host:5237 cargo test -p dm-conn --test tls_verify   # TLS 证书校验（服务端配置见 crates/dm-conn/tests/tls/README.md）
 cargo test -p dm-sqlx --features sqlx       # sqlx 驱动；默认测试不打开这个 feature
 RUST_LOG=dm_conn=trace ...                  # 打印原始帧，便于对照规格排错（登录请求只输出命令号和长度）
 ```
@@ -119,3 +120,14 @@ RUST_LOG=dm_conn=trace ...                  # 打印原始帧，便于对照规�
 集成测试需要一个 DM8 实例，例如：
 `docker run -d --name dm8 -p 5236:5236 -e PAGE_SIZE=16 -e EXTENT_SIZE=32 -e LOG_SIZE=256 -e UNICODE_FLAG=1 -e LENGTH_IN_CHAR=1 -e SYSDBA_PWD=SYSDBA001 <达梦官方 dm8 镜像>`
 （镜像仅用于本地兼容性测试，请遵守达梦的开发者许可条款，不要再分发镜像或其中文件。）
+
+## TLS 证书校验
+
+服务端 `ENABLE_ENCRYPT=1/4` 时连接自动升级为 TLS，**默认校验证书**（系统根证书 + 主机名）。URL 参数：
+
+```
+dm://user:pass@host:5236?ssl_ca=/path/ca.pem                 # 只信任该 CA（PEM，可多张）
+dm://user:pass@10.0.0.5:5236?ssl_ca=/path/ca.pem&ssl_server_name=db.local   # 校验名与连接地址不同
+dm://user:pass@host:5236?ssl_verify=false                     # 不校验（DM 安装自带的自签证书）
+```
+对应 `ConnectOptions::{tls_verify, tls_ca_file, tls_server_name}`。注意：从旧版本升级后，连接用 DM 默认自签证书的 TLS 实例需显式 `ssl_verify=false` 或提供 CA。

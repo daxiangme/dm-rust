@@ -188,7 +188,7 @@ TCP connect (NoDelay, KeepAlive)
 
 - sslEncrypt = 1 或 4：startup 响应后，在**同一 TCP 连接**上做 TLS 握手（客户端；服务端证书不校验时 `InsecureSkipVerify`），之后所有消息（含 LOGIN）都经 TLS，且不再启用整包对称加密外的任何差异。
 - sslEncrypt = 2：握手时需提供客户端证书+私钥（认证用），握手完成后**丢弃 TLS 层**，后续回到明文 TCP（仅用 TLS 完成认证）。
-- 本实现：模式 1/4 用 rustls；模式 2 记为未实现。
+- 本实现：模式 1/4 用 rustls，**默认校验**证书链与服务器名（系统根证书；`ssl_ca` 指定自定义 CA 时只信任它；`ssl_server_name` 覆盖校验名；`ssl_verify=false` 关闭校验以兼容 DM 默认自签证书）；模式 2 记为未实现。
 
 ## 7. LOGIN(1)
 
@@ -587,3 +587,4 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
     - **IDENTITY**。`id int identity(1,1) primary key` 插入一行（只写其它列）后，EXECUTE 响应的影响行数是 1，自增 id 列表是 `[1]`（响应里带了自增 id 标志时客户端才填这个列表）。即使写了列清单，`insert into t(id, s) values(1, 'b')` 在未执行 `SET IDENTITY_INSERT t ON` 时返回 **-2723**，消息为「仅当指定列列表，且SET IDENTITY_INSERT为ON时，才能对自增列赋值」。这不是唯一约束。
     - **SAVEPOINT 是 SQL，不是新命令号**。协议事务（`begin` 只把 auto_commit 置 0，`commit` / `rollback` 发 CMD_COMMIT=8 / CMD_ROLLBACK=9）里面可以执行 `SAVEPOINT`、`ROLLBACK TO SAVEPOINT`、`RELEASE SAVEPOINT`。一次测量：表里已有已提交的 1 行；事务内再插入 1 行、`SAVEPOINT`、再插入 1 行、`ROLLBACK TO SAVEPOINT` 之后 `count(*)` 为 2（已提交的 1 行 + 保存点之前的那一行）；`RELEASE SAVEPOINT` 成功；协议 `rollback` 之后 `count(*)` 回到 1。
 21. **GB18030 实例**（docker `UNICODE_FLAG=0`，DM8 8.1.4.6）：STARTUP 响应 @28 返回非 1/2 值，按 GB18030 编解码即可；SQL 文本、VARCHAR/CLOB 绑定与结果（含 >2048 字节的带外 CLOB）、中文表名/列名、注释、服务端中文错误消息、4 字节字符（扩展 B 区汉字、emoji）往返均正确；`lengthb('中文')=4`。测试：`crates/dm-conn/tests/gb18030.rs`（默认连 127.0.0.1:5237，连不上跳过）。
+22. **TLS 证书校验**（ENABLE_ENCRYPT=1，服务端 `bin/server_ssl/` 换成自签 CA 签发的 server-cert.pem/server-key.pem，SAN=localhost,127.0.0.1）：rustls 用该 CA 校验通过（IP 与 DNS 名均可）；服务器名不符、无关 CA、仅系统根证书时握手被拒（客户端报 TLS 错误，服务端日志 `Initializing SSL Connect failed`），`ssl_verify=false` 可连。服务端不要求客户端证书。测试：`crates/dm-conn/tests/tls_verify.rs`。

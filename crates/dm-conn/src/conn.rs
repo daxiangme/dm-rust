@@ -191,7 +191,7 @@ impl Connection {
         let f = self.send_recv(req, false).await?;
         // 登录响应不含口令；请求侧载荷已在 log_req 中省略。
         trace!("login resp raw: {:02x?}", &f.data[..]);
-        self.login = LoginResponse::parse(&f, enc).map_err(|e| {
+        self.login = LoginResponse::parse_with(&f, enc, sr.msg_version).map_err(|e| {
             trace!("login response parse failed: {e}; raw hex: {}", hex(&f.data));
             e
         })?;

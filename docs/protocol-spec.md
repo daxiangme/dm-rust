@@ -590,3 +590,5 @@ YM 的 @8 与 DT 的 @20 都是一个小端 i32，并且与列描述 / 参数描
 22. **TLS 证书校验**（ENABLE_ENCRYPT=1，服务端 `bin/server_ssl/` 换成自签 CA 签发的 server-cert.pem/server-key.pem，SAN=localhost,127.0.0.1）：rustls 用该 CA 校验通过（IP 与 DNS 名均可）；服务器名不符、无关 CA、仅系统根证书时握手被拒（客户端报 TLS 错误，服务端日志 `Initializing SSL Connect failed`），`ssl_verify=false` 可连。服务端不要求客户端证书。测试：`crates/dm-conn/tests/tls_verify.rs`。
 
 > 兼容性（旧版 DM8，如 08.00.00）：STARTUP 响应是否含版本串按**协商后** MsgVersion=min(客户端,服务端)<21 判断（与官方驱动一致）；变长区起点先按 @80 解析，失败（版本串非点分可打印字符/长度不自洽）再按 @64 解析；LOGIN 响应同样 @80→@64 回退。包头 @6 body 长度与实际不符时报“对端不像 DM 服务器”。解析失败时 `RUST_LOG=dm_conn=trace` 输出原始响应 hex。`[待实测：旧版本服务器原始报文]`
+
+> 更新（MsgVersion 6 服务器，DM8 08.00.00 / DB Version 0x7000d）：官方 Go 驱动读 STARTUP/LOGIN 响应时统一 `pos=64` 起读变长区，两者布局无任何 MsgVersion 分支；会话 MsgVersion=min(8,服务端)。后续消息的版本分支只有 ≥3（PREPARE/EXEC @38 等）与 ≥6（大参数带外），均对 6 成立，故 6 与 8 后续报文一致。本驱动：服务端 @48 ≤6 时优先 @64（与 Go 一致），否则优先 @80（8.1.4.6/MsgVersion 11 实测 @64..@79 为 16 字节 0），失败再试另一种。`[待实测：MsgVersion 6 真机原始报文；扩展区出现的确切版本阈值]`

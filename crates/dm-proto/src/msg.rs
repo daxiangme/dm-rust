@@ -92,7 +92,7 @@ impl StartupResponse {
         let neg = msg_version.min(client_msg_version);
         let has_ver = neg < 21;
         let mut first_err = None;
-        for &start in &[80usize, 64] {
+        for &start in var_area_order(msg_version) {
             match Self::parse_at(f, start, has_ver) {
                 Ok(v) => return Ok(v),
                 Err(e) => { first_err.get_or_insert(e); }
@@ -146,6 +146,15 @@ impl StartupResponse {
             hash_id,
         })
     }
+}
+
+/// STARTUP/LOGIN 响应变长区起点。官方 Go 驱动（gitee chunanyong/dm，`Dm_build_1327(64, ..)`）
+/// 对所有版本都从 @64（紧接包头）读取，且 STARTUP/LOGIN 的布局不含任何 MsgVersion 分支；
+/// 但 8.1.4.6（服务端 MsgVersion 11）实测在 @64..@79 有 16 字节全 0 扩展，变长区从 @80 起。
+/// 因此：服务端 MsgVersion ≤ 6（如 DM8 08.00.00 / DB Version 0x7000d）按 Go 驱动精确使用 @64，
+/// 更新的版本使用 @80；首选布局校验失败时再尝试另一种。
+pub fn var_area_order(server_msg_version: u16) -> &'static [usize] {
+    if server_msg_version <= 6 { &[64, 80] } else { &[80, 64] }
 }
 
 /// 粗检对端是否为 DM：包头 @6 的 body 长度应与实际一致。
@@ -223,12 +232,17 @@ pub struct LoginResponse {
 }
 
 impl LoginResponse {
-    /// 变长区起点新版本 @80，旧版本可能 @64；依次尝试。
-    pub fn parse(f: &Frame, enc: Encoding) -> Result<Self> {
-        match Self::parse_at(f, enc, 80) {
+    /// `server_msg_version` 为 STARTUP 响应 @48 原值，决定变长区起点（见 [`var_area_order`]）。
+    pub fn parse_with(f: &Frame, enc: Encoding, server_msg_version: u16) -> Result<Self> {
+        let order = var_area_order(server_msg_version);
+        match Self::parse_at(f, enc, order[0]) {
             Ok(v) => Ok(v),
-            Err(e) => Self::parse_at(f, enc, 64).map_err(|_| e),
+            Err(e) => Self::parse_at(f, enc, order[1]).map_err(|_| e),
         }
+    }
+
+    pub fn parse(f: &Frame, enc: Encoding) -> Result<Self> {
+        Self::parse_with(f, enc, 8)
     }
 
     fn parse_at(f: &Frame, enc: Encoding, start: usize) -> Result<Self> {
@@ -1078,5 +1092,70 @@ mod tests {
         assert!(!er.columns_from_response);
         assert_eq!(er.update_count, 2);
         assert!(!no_more_results(0, er.sql_type));
+    }
+
+    fn frame_bytes(head: &[(usize, &[u8])], var_start: usize, var: &[u8]) -> Frame {
+        let mut d = vec![0u8; var_start];
+        for (o, b) in head {
+            d[*o..*o + b.len()].copy_from_slice(b);
+        }
+        d.extend_from_slice(var);
+        let body = (d.len() - 64) as i32;
+        d[6..10].copy_from_slice(&body.to_le_bytes());
+        Frame::new(Bytes::from(d)).unwrap()
+    }
+
+    fn startup_var(ver: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(ver.len() as i32).to_le_bytes());
+        v.extend_from_slice(ver.as_bytes());
+        v.extend_from_slice(&(-1i32).to_le_bytes()); // cipher id
+        v.extend_from_slice(&64i32.to_le_bytes());
+        v.extend_from_slice(&[0x5a; 64]);
+        v.extend_from_slice(&(-1i32).to_le_bytes()); // hash id
+        v
+    }
+
+    #[test]
+    fn startup_msg_version_6_at_64() {
+        let f = frame_bytes(&[(40, &[1, 2]), (48, &6u16.to_le_bytes())], 64, &startup_var("8.0.0.0"));
+        let sr = StartupResponse::parse_with(&f, 8).unwrap();
+        assert_eq!(sr.server_version.as_deref(), Some("8.0.0.0"));
+        assert_eq!(sr.cipher_id, Some(-1));
+        assert_eq!(sr.server_public.unwrap().len(), 64);
+        assert_eq!(sr.hash_id, Some(-1));
+    }
+
+    #[test]
+    fn startup_msg_version_11_at_80() {
+        let f = frame_bytes(&[(40, &[1, 2]), (48, &11u16.to_le_bytes())], 80, &startup_var("8.1.4.6"));
+        let sr = StartupResponse::parse_with(&f, 8).unwrap();
+        assert_eq!(sr.server_version.as_deref(), Some("8.1.4.6"));
+        assert_eq!(sr.server_public.unwrap().len(), 64);
+    }
+
+    #[test]
+    fn startup_non_dm_peer() {
+        let f = Frame::new(Bytes::from(vec![0x48u8; 100])).unwrap();
+        assert!(StartupResponse::parse_with(&f, 8).unwrap_err().to_string().contains("DM server"));
+    }
+
+    #[test]
+    fn login_msg_version_6_at_64() {
+        let mut v = Vec::new();
+        for s in ["DMSERVER", "SYSDBA", "", ""] {
+            v.extend_from_slice(&(s.len() as i32).to_le_bytes());
+            v.extend_from_slice(s.as_bytes());
+        }
+        v.extend_from_slice(&[0; 12]);
+        for s in ["GUID", "DAMENG"] {
+            v.extend_from_slice(&(s.len() as i32).to_le_bytes());
+            v.extend_from_slice(s.as_bytes());
+        }
+        let f = frame_bytes(&[], 64, &v);
+        let l = LoginResponse::parse_with(&f, Encoding::Utf8, 6).unwrap();
+        assert_eq!(l.instance_name, "DMSERVER");
+        assert_eq!(l.schema, "SYSDBA");
+        assert_eq!(l.db_name, "DAMENG");
     }
 }

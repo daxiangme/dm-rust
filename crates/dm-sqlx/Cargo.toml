@@ -3,6 +3,12 @@ name = "dm-sqlx"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+exclude = ["tests/tls/", "tests/fixtures/", "*.pem", "*.key"]
 description = "Optional sqlx-core 0.8 driver for Dameng DM8. Enable the `sqlx` feature."
 
 [features]
@@ -20,8 +26,8 @@ sqlx = [
 ]
 
 [dependencies]
-dm-conn = { path = "../dm-conn", optional = true }
-dm-proto = { path = "../dm-proto", optional = true }
+dm-conn = { version = "0.1.0", path = "../dm-conn", optional = true }
+dm-proto = { version = "0.1.0", path = "../dm-proto", optional = true }
 sqlx-core = { version = "=0.8.6", default-features = false, features = ["_rt-tokio"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 futures-core = { version = "0.3", default-features = false, features = ["alloc"], optional = true }

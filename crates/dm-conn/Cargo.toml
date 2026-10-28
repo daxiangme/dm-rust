@@ -3,6 +3,12 @@ name = "dm-conn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+exclude = ["tests/tls/", "tests/fixtures/", "*.pem", "*.key"]
 description = "Async (tokio) Dameng DM8 client: connection, session, statement cache, transactions"
 
 [features]
@@ -10,7 +16,7 @@ default = ["tls"]
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs"]
 
 [dependencies]
-dm-proto = { path = "../dm-proto" }
+dm-proto = { version = "0.1.0", path = "../dm-proto" }
 bytes.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

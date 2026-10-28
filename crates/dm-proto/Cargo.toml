@@ -3,6 +3,12 @@ name = "dm-proto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+exclude = ["tests/tls/", "tests/fixtures/", "*.pem", "*.key"]
 description = "Dameng DM8 wire protocol codec (no IO)"
 
 [dependencies]

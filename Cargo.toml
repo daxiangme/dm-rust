@@ -6,6 +6,10 @@ members = ["crates/dm-proto", "crates/dm-conn", "crates/dm-pool", "crates/dm-sql
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/daxiangme/dm-rust"
+homepage = "https://github.com/daxiangme/dm-rust"
+keywords = ["dameng", "dm8", "database", "driver"]
+categories = ["database", "asynchronous"]
 
 [workspace.dependencies]
 bytes = "1"

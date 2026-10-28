@@ -3,10 +3,16 @@ name = "dm-pool"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+exclude = ["tests/tls/", "tests/fixtures/", "*.pem", "*.key"]
 description = "Async connection pool for the dm-conn Dameng DM8 client"
 
 [dependencies]
-dm-conn = { path = "../dm-conn" }
+dm-conn = { version = "0.1.0", path = "../dm-conn" }
 thiserror.workspace = true
 tokio.workspace = true
 

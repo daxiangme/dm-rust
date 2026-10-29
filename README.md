@@ -4,15 +4,37 @@
 `docs/protocol-spec.md`（中文，帧格式 / 命令号 / 握手与加密 / prepare-execute-fetch / 类型编码 / LOB / 事务 / 错误包，
 末节为真机实测记录）→ `src/` 仅依据该规格实现。**未拷贝任何第三方驱动的代码或注释。**
 
-## 结构
+## 使用方
 
-单个 crate `dm-rust`（库名 `dm_rust`）。默认 feature 是 `tls`（只编译连接层）。
+| 项目 | 说明 |
+|---|---|
+| [ShellAX](https://github.com/daxiangme/ShellAX) | 跨平台终端 / SSH 客户端。达梦连接使用 `pool`：每个已保存连接一个连接池，用于查询、表浏览，以及本机数据库 MCP（目前支持 MySQL 与达梦）。 |
+
+## 依赖
+
+已发布到 [crates.io](https://crates.io/crates/dm-rust)。包名是 `dm-rust`，代码里的库名是 `dm_rust`。`0.1` 匹配当前的 `0.1.0`。
 
 ```toml
-dm-rust = { version = "0.1", features = ["tls"] }
-# dm-rust = { version = "0.1", features = ["pool"] }
-# dm-rust = { version = "0.1", features = ["sqlx"] }
+[dependencies]
+dm-rust = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
+
+默认 feature 是 `tls`，只编译连接层（握手、登录、查询、事务）。不写 `features` 就会带上它。`pool` 和 `sqlx` 默认关闭。Cargo 的 feature 是追加的，写上下面两项时 `tls` 仍然保留。
+
+```toml
+# 自带连接池
+dm-rust = { version = "0.1", features = ["pool"] }
+
+# sqlx-core 0.8 驱动
+dm-rust = { version = "0.1", features = ["sqlx"] }
+```
+
+调用方需要自己的 tokio 运行时。`#[tokio::main]` 至少要打开 `macros` 和 `rt-multi-thread`（或 `rt`）。
+
+## 结构
+
+单个 crate `dm-rust`（库名 `dm_rust`）。
 
 | 模块 | feature | 内容 |
 |---|---|---|
@@ -22,6 +44,8 @@ dm-rust = { version = "0.1", features = ["tls"] }
 | `sqlx` | `sqlx` | 可选的 sqlx-core 0.8 驱动（默认关闭）。连接池用 sqlx 自带的 `Pool` |
 
 ## 用法
+
+下面的片段放在异步函数里，例如 `#[tokio::main] async fn main() -> dm_rust::Result<()>`。
 
 ```rust
 let opts = dm_rust::ConnectOptions::from_url("dm://SYSDBA:SYSDBA001@127.0.0.1:5236")?;
@@ -70,7 +94,7 @@ cargo build --all-targets --features sqlx
 cargo test --features sqlx --test sqlx
 ```
 
-依赖：
+依赖（默认的 `tls` 会保留）：
 
 ```toml
 dm-rust = { version = "0.1", features = ["sqlx"] }

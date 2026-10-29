@@ -1,6 +1,6 @@
 [package]
 name = "dm-rust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Async Tokio driver for Dameng DM8: wire protocol, connections, optional pool, and optional sqlx-core 0.8"
 license = "Apache-2.0"

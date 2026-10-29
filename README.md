@@ -12,7 +12,7 @@
 
 ## 依赖
 
-已发布到 [crates.io](https://crates.io/crates/dm-rust)。包名是 `dm-rust`，代码里的库名是 `dm_rust`。`0.1` 匹配当前的 `0.1.0`。
+已发布到 [crates.io](https://crates.io/crates/dm-rust)。包名是 `dm-rust`，代码里的库名是 `dm_rust`。`0.1` 匹配当前的 `0.1.1`。
 
 ```toml
 [dependencies]
